@@ -26,7 +26,13 @@ def roots():
 
 def candidates():
     root,folders,projects=roots();seen=set()
+    allowed=[Path(p['path']).resolve() for p in projects]+([root.resolve()] if root else [])
     for folder in folders:
+        if folder.name=='skills':
+            for alias in sorted(folder.iterdir()):
+                if alias.is_symlink() and alias.is_dir() and any(alias.resolve().is_relative_to(p) for p in allowed):
+                    entry=alias/'SKILL.md'
+                    if entry.is_file() and str(entry) not in seen:seen.add(str(entry));yield entry,'skill'
         for base,dirs,files in os.walk(folder,followlinks=False):
             dirs[:]=sorted(d for d in dirs if d not in SKIP and not (Path(base)/d).is_symlink())
             for name in sorted(files):
@@ -45,7 +51,7 @@ def describe(path,kind):
     if path.stat().st_size>2*1024**2:raise ValueError('知识入口超过 2 MiB，原件仍可备份')
     raw=path.read_bytes();text=raw.decode('utf-8',errors='replace');sha=hashlib.sha256(raw).hexdigest()
     title=path.parent.name if kind=='skill' else path.name
-    body={'source_node':node.identity(),'bytes':len(raw),'preview_truncated':len(text)>16000,'resources':[],
+    body={'resolved_path':str(path.resolve()),'source_node':node.identity(),'bytes':len(raw),'preview_truncated':len(text)>16000,'resources':[],
           'coverage':'展示为脱敏预览；完整原件通过加密恢复点保存。依赖只记录明确引用，不推断已执行。'}
     if kind=='configuration':
         parsed=tomllib.loads(text)

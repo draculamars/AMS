@@ -209,6 +209,8 @@ def stage(p, report, folder):
     small_db=next((x for x in copies if x['bytes']<20*1024**2),None)
     if small_db:candidates.append(Path(small_db['snapshot_path']))
     for path in candidates:
+        path=path.resolve()
+        if not any(path.is_relative_to(Path(root)) for root in report['roots']+[str(folder)]):continue
         if path.is_file() and not path.is_symlink() and path.stat().st_size<20*1024**2:
             before=path.stat()
             with path.open('rb') as f:sha=hashlib.file_digest(f,'sha256').hexdigest()
@@ -321,6 +323,9 @@ def restore(progress,rid):
             if rc:raise ValueError('恢复失败：'+' '.join(errors)[-1000:])
             # Ensure an incorrect include pattern cannot be reported as a useful restore.
             if not all((target/x.lstrip('/')).exists() or (target/x.lstrip('/')).is_symlink() for x in body['paths']):raise ValueError('部分选定路径不存在于恢复点，未完成全部选定内容')
+            for selected in body['paths']:
+                restored=target/selected.lstrip('/')
+                if not restored.is_symlink() and not restored.resolve().is_relative_to(target.resolve()):raise ValueError('选定内容通过符号链接指向隔离目录之外；请恢复实际来源路径')
             body['verified']=True
     except Exception as e:body['error']=str(e);status='failed'
     with db.connect() as c:
@@ -338,6 +343,7 @@ def drill(progress,sid):
         evidence.update(target=result['target'],restore_id=result['id'])
         for x in samples:
             path=Path(result['target'])/x['path'].lstrip('/')
+            if not path.resolve().is_relative_to(Path(result['target']).resolve()):raise ValueError('恢复样本指向隔离目录之外，不能作为恢复证据')
             with path.open('rb') as f:sha=hashlib.file_digest(f,'sha256').hexdigest()
             check={'path':x['path'],'sha256_matches':sha==x['sha256']}
             if path.suffix in {'.sqlite','.sqlite3','.db'}:

@@ -43,7 +43,10 @@ def test_sqlite_wal_snapshot_is_consistent_and_private(recovery,tmp_path):
     assert str(codex/'example.sqlite-wal') in r['excluded']
 
 def test_real_encrypted_backup_versions_check_and_isolated_restore(recovery,env,tmp_path,real_restic):
-    p,codex,_=recovery;pid=p['id'];vault.initialize(pid)
+    p,codex,_=recovery;pid=p['id']
+    package=env/'linked-skill';package.mkdir();(package/'SKILL.md').write_text('original linked skill')
+    alias=codex/'skills/a-alias';alias.symlink_to(package,target_is_directory=True)
+    vault.initialize(pid)
     result=vault.backup(lambda *a:None,pid);sid=result['id'];s=vault.snapshot(sid)
     assert result['status']=='complete'
     assert vault.verify(lambda *a:None,sid,True)['status']=='passed'
@@ -54,6 +57,7 @@ def test_real_encrypted_backup_versions_check_and_isolated_restore(recovery,env,
     database_restore=vault.restore(lambda *a:None,database_plan['id'])
     restored_db=Path(database_restore['target'])/database_plan['paths'][0].lstrip('/')
     with sqlite3.connect(restored_db) as c:assert c.execute('SELECT value FROM sample').fetchone()[0]=='saved'
+    with pytest.raises(ValueError):vault.restore(lambda *a:None,vault.restore_plan(sid,[str(alias/'SKILL.md')])['id'])
     # Original credential data is recoverable but never sent to the web catalog.
     plan=vault.restore_plan(sid,[str(codex/'auth.json')]);r=vault.restore(lambda *a:None,plan['id'])
     target=Path(r['target'])/str(codex/'auth.json').lstrip('/')
@@ -127,3 +131,23 @@ def test_restore_failure_is_preserved_as_drill_evidence(recovery,monkeypatch):
     monkeypatch.setattr(vault,'restore',fail)
     with pytest.raises(ValueError,match='unavailable'):vault.drill(lambda *a:None,'failed-drill')
     assert vault.snapshot('failed-drill')['body']['restore_drill']['status']=='failed'
+
+def test_skill_alias_uses_canonical_backup_sample(recovery,env,tmp_path,monkeypatch):
+    p,codex,_=recovery;package=env/'skill';package.mkdir();(package/'SKILL.md').write_text('linked skill')
+    alias=codex/'skills/a-alias';alias.symlink_to(package,target_is_directory=True)
+    report=vault.plan(p['id']);vault.stage(vault.profile(p['id']),report,tmp_path/'stage')
+    assert str(package/'SKILL.md') in [x['path'] for x in report['restore_samples']]
+    assert str(alias/'SKILL.md') not in [x['path'] for x in report['restore_samples']]
+    monkeypatch.setattr(knowledge,'roots',lambda:(codex,[codex/'skills'],[{'path':str(env)}]))
+    knowledge.scan();item=next(x for x in knowledge.listing()['items'] if x['path']==str(alias/'SKILL.md'))
+    assert item['body']['resolved_path']==str(package/'SKILL.md')
+
+def test_drill_rejects_reading_source_through_restored_link(recovery,env,tmp_path,monkeypatch):
+    p,_,_=recovery;source=env/'original';source.write_text('source still exists')
+    target=tmp_path/'restore';target.mkdir();(target/'alias').symlink_to(env,target_is_directory=True)
+    sample={'path':'/alias/original','sha256':hashlib.sha256(source.read_bytes()).hexdigest()}
+    vault.save_snapshot('outside',vault.profile(p['id']),'complete',{'restic_snapshot':'a'*64,'restore_samples':[sample]},'2026-10-17')
+    monkeypatch.setattr(vault,'restore_plan',lambda *a:{'id':'plan'})
+    monkeypatch.setattr(vault,'restore',lambda *a:{'id':'restored','target':str(target)})
+    with pytest.raises(ValueError,match='隔离目录之外'):vault.drill(lambda *a:None,'outside')
+    assert vault.snapshot('outside')['body']['restore_drill']['status']=='failed'
