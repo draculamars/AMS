@@ -2,7 +2,7 @@
 
 AMS 是可部署在 macOS、Ubuntu 的私人资产管理系统。它把项目文件、文档、模型、已有 Git 历史、资产快照和 Codex 开发记录放入同一个工作空间。浏览器可从桌面、平板和手机访问。
 
-**当前版本：0.4.0。** 每个服务实例展示自身节点的工作目录与已经完整接收的归档映射。机器名称、SSH 目标、存储位置均属于部署配置。
+**当前版本：0.4.1。** 每个服务实例展示自身节点的工作目录与已经完整接收的归档映射。机器名称、SSH 目标、存储位置均属于部署配置。
 
 ## 可以做什么
 
@@ -55,7 +55,7 @@ export ASSET_BLOB_DIR="$HOME/AssetVault/archive"
 
 ## 开发过程与关系证据
 
-AMS 只读访问配置目录下的 Codex `state_5.sqlite` 与 `thread_history_1.sqlite`，自动发现已配置且本机存在的 Codex 项目目录（只建立索引，不创建 Git 仓库），并关联工程路径。默认来源是 `~/.codex`，可用 `ASSET_CODEX_HOME` 或工作台设置替换。
+AMS 只读访问配置目录下的 Codex `state_5.sqlite` 与 `thread_history_1.sqlite`；若会话尚无 SQLite 投影，则从该目录内对应 JSONL 的公开事件补全。自动发现已配置且本机存在的 Codex 项目目录（只建立索引，不创建 Git 仓库），并关联工程路径。默认来源是 `~/.codex`，可用 `ASSET_CODEX_HOME` 或工作台设置替换。
 
 只收录用户消息、公开助手消息、文件变更事件与命令执行状态。不会读取认证文件、推理条目或执行记录中的命令。明显凭据会遮盖；开发记录仍属于私人数据，应保留在自己的部署与备份中。
 
@@ -64,7 +64,7 @@ AMS 只读访问配置目录下的 Codex `state_5.sqlite` 与 `thread_history_1.
 - 内容依赖来自实际解析引用或人工确认，不依据“同一会话提到两个文件”自动认定。
 - 脚本生成文件、外部工具修改、未保存的会话可能缺少文件级事件；可结合索引采样与 Git 历史核对。
 - 会话基线 commit 是会话元数据，不代表每轮修改都已提交。
-- 本地 SQLite 格式不是稳定公共 API；适配器检查 schema，格式不支持时显示错误。官方公共接口见 [Codex App Server](https://developers.openai.com/codex/app-server)。
+- 本地 SQLite 与 JSONL 格式不是稳定公共 API；适配器检查 schema，格式不支持时显示错误。JSONL 仅接收允许的公开完成事件，超过 4 MiB 的单行会跳过并记录数量。官方公共接口见 [Codex App Server](https://developers.openai.com/codex/app-server)。
 
 开发记录随项目同步到归档节点。没有 Codex 安装的服务器仍可浏览同步的记录。
 

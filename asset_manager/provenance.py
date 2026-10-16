@@ -111,16 +111,23 @@ def ingest(progress=lambda *a:None):
         for table,columns,con in [('threads',{'id','cwd','title','updated_at','git_sha'},state),('thread_items',{'item_type','item_json','turn_id','item_id'},history)]:
             found={r['name'] for r in con.execute('PRAGMA table_info('+table+')')}
             if not columns<=found:raise ValueError('Codex 本地数据格式已变化：'+table+'；请升级适配器')
-        sessions=[dict(r) for r in state.execute('SELECT id,cwd,title,updated_at,git_sha,git_branch,archived FROM threads')]
+        columns={r['name'] for r in state.execute('PRAGMA table_info(threads)')}
+        extra=',rollout_path' if 'rollout_path' in columns else ''
+        sessions=[dict(r) for r in state.execute('SELECT id,cwd,title,updated_at,git_sha,git_branch,archived'+extra+' FROM threads')]
         for s in sessions:
             p=match_project(s['cwd'],projects)
             if not p:continue
             sid=node['id']+':'+s['id']
             # Active turns can change without a new thread updated_at second.
             marker=history.execute('SELECT MAX(updated_at_ordinal),COUNT(*) FROM thread_items WHERE thread_id=?',(s['id'],)).fetchone()
-            revision=f"v2:{s['updated_at']}:{marker[0]}:{marker[1]}"
+            revision=f"v3:{s['updated_at']}:{marker[0]}:{marker[1]}"
+            rollout=Path(s.get('rollout_path') or '/nonexistent')
+            if marker[1]==0 and rollout.is_file():revision+=f":{rollout.stat().st_size}:{rollout.stat().st_mtime_ns}"
             if known.get(sid)==revision:continue
             turns=[dict(r) for r in history.execute('SELECT * FROM thread_turns WHERE thread_id=? ORDER BY rollout_ordinal',(s['id'],))]
+            fallback=rollout_turns(rollout,root,s['id']) if not turns and s.get('rollout_path') else []
+            if fallback:turns=[t for t,_ in fallback]
+            fallback_items={t['turn_id']:items for t,items in fallback}
             sb={'thread_id':s['id'],'source_node':node,'cwd':s['cwd'],'branch':s['git_branch'],'baseline_commit':s['git_sha'],
                 'archived':bool(s['archived']),'source_revision':revision,'adapter':'codex-local-projection-v1'}
             with db.connect() as c:
@@ -128,7 +135,10 @@ def ingest(progress=lambda *a:None):
                 for t in turns:
                     tid=node['id']+':'+s['id']+':'+t['turn_id']
                     items=history.execute('SELECT item_id,item_json FROM thread_items WHERE thread_id=? AND turn_id=? AND item_type IN (?,?,?,?) ORDER BY rollout_ordinal',(s['id'],t['turn_id'],*TYPES))
+                    if t['turn_id'] in fallback_items:items=fallback_items[t['turn_id']]
                     body,artifacts=parse_turn(t,items,s,projects,known_files)
+                    if fallback:
+                        body['source']='codex-rollout-public-v1';body['rollout_skipped_lines']=t.get('rollout_skipped_lines',0)
                     c.execute('INSERT OR REPLACE INTO development_turns VALUES(?,?,?,?,?)',(tid,sid,p['id'],iso(t['started_at']),json.dumps(body,ensure_ascii=False)))
                     c.execute('DELETE FROM development_artifacts WHERE turn_id=?',(tid,))
                     for a in artifacts:
@@ -162,7 +172,7 @@ def export_project(pid):
     with db.connect() as c:
         turns=[dict(r) for r in c.execute('SELECT * FROM development_turns WHERE project_id=? OR id IN (SELECT turn_id FROM development_artifacts WHERE project_id=?)',(pid,pid))]
         ids={t['session_id'] for t in turns}; tids={t['id'] for t in turns}
-        return {'development_sessions':[dict(r) for r in c.execute('SELECT * FROM development_sessions') if r['id'] in ids],
+        return {'development_sessions':[dict(r) for r in c.execute('SELECT * FROM development_sessions') if r['id'] in ids or r['project_id']==pid],
                 'development_turns':turns,'development_artifacts':[dict(r) for r in c.execute('SELECT * FROM development_artifacts') if r['turn_id'] in tids]}
 
 def discover_projects():
@@ -213,3 +223,46 @@ def sync(progress=lambda *a:None,pid=None):
         results.append(project_sync.remote_json(cfg,'import-development',payload={'project_id':project,'source_node':node.identity(),'development':export_project(project)}))
     progress(len(projects),len(projects),'开发记录同步完成')
     return {'projects':results}
+
+def rollout_turns(path, root, thread_id):
+    """Fallback for persisted public events not present in the SQLite projection."""
+    path=Path(path).expanduser().resolve()
+    if not path.is_relative_to(root) or path.suffix!='.jsonl' or not path.is_file():return []
+    grouped={};current='initial';skipped=0
+    def stamp(value):
+        try:return datetime.fromisoformat(value.replace('Z','+00:00')).timestamp()
+        except (TypeError,ValueError,AttributeError):return 0
+    def get(key,ts):
+        if key not in grouped:grouped[key]=({'turn_id':key,'status':'in_progress','started_at':stamp(ts),'completed_at':None,'duration_ms':None},[])
+        return grouped[key]
+    with path.open('rb') as f:
+        ordinal=0
+        while True:
+            line=f.readline(4*1024*1024+1)
+            if not line:break
+            ordinal+=1
+            if len(line)>4*1024*1024:
+                while line and not line.endswith(b'\n'):line=f.readline(4*1024*1024)
+                skipped+=1;continue
+            try:record=json.loads(line)
+            except (ValueError,UnicodeDecodeError):skipped+=1;continue
+            if record.get('type')!='event_msg':continue
+            payload=record.get('payload',{});kind=payload.get('type');ts=record.get('timestamp')
+            if payload.get('thread_id') and payload['thread_id']!=thread_id:continue
+            if kind=='task_started':current=payload.get('turn_id') or str(ordinal);get(current,ts)
+            elif kind in {'task_complete','task_completed','turn_aborted'}:
+                turn,_=get(payload.get('turn_id') or current,ts);turn['status']='interrupted' if kind=='turn_aborted' else 'completed';turn['completed_at']=stamp(ts)
+            elif kind=='item_completed':
+                item=payload.get('item',{});item_type=item.get('type')
+                if item_type not in TYPES:continue
+                # Drop opaque tool output and all unsupported items before retaining an event.
+                public={k:item.get(k) for k in ['type','id','content','text','phase','changes','status','command','exitCode','durationMs'] if k in item}
+                if 'text' in public:public['text']=clean(public['text'])
+                if 'command' in public:public['command']=clean(public['command'],600)
+                if 'changes' in public:public['changes']=[{k:clean(v) if k=='diff' else v for k,v in change.items() if k in {'path','kind','diff'}} for change in public['changes']]
+                turn,items=get(payload.get('turn_id') or current,ts)
+                items.append({'item_id':item.get('id') or 'rollout-'+str(ordinal),'item_json':json.dumps(public,ensure_ascii=False)})
+    result=[]
+    for turn,items in grouped.values():
+        if items:turn['rollout_skipped_lines']=skipped;result.append((turn,items))
+    return result

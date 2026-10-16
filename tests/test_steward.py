@@ -91,6 +91,10 @@ def test_mirror_current_pointer_can_revert_to_earlier_blob(env):
         c.execute('INSERT INTO mirror_files VALUES(?,?,?,?)',('p','a.md',a['sha256'],a['size']))
     assert core.source_path(aid)[0].read_text()=='A'
     assert node.current_paths('p')=={'a.md'}
+    assert project_sync.remote_inventory('p')['assets']['a.md']['sha']==a['sha256']
+    # Repeat synchronization must reuse the current A pointer, not the later-inserted B history.
+    with db.connect() as c:c.execute('UPDATE mirror_files SET sha256=? WHERE project_id=?',(b['sha256'],'p'))
+    assert project_sync.remote_inventory('p')['assets']['a.md']['sha']==b['sha256']
 
 def test_workbench_and_development_api(env,tmp_path,client):
     put(env,'notes.md','Overview');core.scan_project('p');node.initialize();history_source(tmp_path,env);provenance.ingest()
@@ -135,3 +139,23 @@ def test_development_metadata_sync_is_idempotent_and_preserves_assets(env,tmp_pa
         assert [dict(r) for r in c.execute('SELECT * FROM assets')]==before
         assert c.execute('SELECT COUNT(*) FROM development_turns').fetchone()[0]==1
     with pytest.raises(ValueError,match='先同步工程'):provenance.receive_project({**data,'project_id':'absent'})
+
+def test_rollout_public_event_fallback_skips_reasoning_and_syncs_session_metadata(env,tmp_path):
+    root=history_source(tmp_path,env)
+    with sqlite3.connect(root/'thread_history_1.sqlite') as c:c.execute('DELETE FROM thread_items');c.execute('DELETE FROM thread_turns')
+    path=root/'rollout.jsonl'
+    events=[{'type':'event_msg','timestamp':'2026-01-01T00:00:00Z','payload':{'type':'task_started','turn_id':'old'}},
+      {'type':'event_msg','payload':{'type':'item_completed','thread_id':'t','turn_id':'old','item':{'type':'userMessage','id':'u','content':[{'type':'text','text':'Restore older model'}]}}},
+      {'type':'event_msg','payload':{'type':'item_completed','thread_id':'t','turn_id':'old','item':{'type':'reasoning','id':'hidden','text':'NOT PUBLIC'}}},
+      {'type':'event_msg','payload':{'type':'item_completed','thread_id':'t','turn_id':'old','item':{'type':'agentMessage','id':'answer','phase':'final','text':'Model restored'}}},
+      {'type':'event_msg','timestamp':'2026-01-01T00:01:00Z','payload':{'type':'task_complete','turn_id':'old'}}]
+    path.write_text('\n'.join(json.dumps(e) for e in events))
+    with sqlite3.connect(root/'state_5.sqlite') as c:
+        c.execute('ALTER TABLE threads ADD COLUMN rollout_path');c.execute('UPDATE threads SET rollout_path=?',(str(path),))
+        c.execute('INSERT INTO threads VALUES(?,?,?,?,?,?,?,?)',('empty',str(env),'Metadata only',100,None,None,0,''))
+    provenance.ingest();data=provenance.listing('p')
+    assert data['total']==1 and data['items'][0]['body']['source']=='codex-rollout-public-v1'
+    assert data['items'][0]['body']['status']=='completed' and 'NOT PUBLIC' not in json.dumps(data)
+    assert len(provenance.export_project('p')['development_sessions'])==2
+    assert provenance.ingest()['sessions_updated']==0
+    assert provenance.rollout_turns(tmp_path/'outside.jsonl',root,'t')==[]

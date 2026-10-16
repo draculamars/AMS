@@ -44,7 +44,7 @@ def remote_json(cfg,mode,*args,payload=None):
 
 def remote_inventory(pid):
     with db.connect() as c:
-        rows=c.execute("SELECT a.relpath,a.size,a.mtime,(SELECT sha256 FROM versions v WHERE v.asset_id=a.id AND reason='snapshot' ORDER BY id DESC LIMIT 1) sha FROM assets a WHERE project_id=?",(pid,)).fetchall()
+        rows=c.execute("SELECT a.relpath,a.size,a.mtime,COALESCE((SELECT mf.sha256 FROM mirror_files mf WHERE mf.project_id=a.project_id AND mf.path=a.relpath),(SELECT sha256 FROM versions v WHERE v.asset_id=a.id AND reason='snapshot' ORDER BY id DESC LIMIT 1)) sha FROM assets a WHERE project_id=?",(pid,)).fetchall()
         runs=[r[0] for r in c.execute('SELECT id FROM project_index_runs WHERE project_id=?',(pid,))]
     folder=db.DATA/'git-history'/'objects';keys=[p.name for p in folder.iterdir() if p.is_dir() and (p/'ATLAS-GIT.json').is_file()] if folder.exists() else []
     objects={}
