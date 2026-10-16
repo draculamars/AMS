@@ -436,3 +436,6 @@ def index(): return FileResponse(STATIC/'index.html')
 
 from .steward_api import router as steward_router
 app.include_router(steward_router)
+
+from .vault_api import router as vault_router
+app.include_router(vault_router)

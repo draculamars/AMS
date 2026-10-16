@@ -12,9 +12,11 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install -r requirements.lock -r requirements-dev.txt
+      - run: python scripts/install-restic.py --destination "${{ runner.temp }}/restic"
       - run: python -m pytest -q
         env:
           ASSET_WATCH_ENABLED: '0'
+          ATLAS_RESTIC: ${{ runner.temp }}/restic
       - run: python scripts/package-release.py release.zip
       - uses: actions/upload-artifact@v4
         with:

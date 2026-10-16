@@ -45,7 +45,9 @@ def search(q:str,limit:int=20):
         files=[{'type':'file','id':r['id'],'project_id':r['project_id'],'title':r['relpath'],'excerpt':r['name']} for r in c.execute('SELECT a.id,a.project_id,a.relpath,p.name FROM assets a JOIN projects p ON p.id=a.project_id WHERE (a.relpath LIKE ? OR a.note LIKE ? OR a.tags LIKE ?) AND '+node.current_sql()+' LIMIT ?',(pattern,pattern,pattern,limit))]
         docs=[{'type':'document','project_id':r['project_id'],'title':r['path'],'excerpt':r['body'][:160]} for r in c.execute('SELECT project_id,path,body FROM project_documents WHERE body LIKE ? LIMIT ?',(pattern,limit))]
     turns=provenance.listing(q=q,limit=min(limit,10))['items']
-    return {'items':(projects+files+docs+[{'type':'development','id':r['id'],'project_id':r['project_id'],'title':r['title'],'excerpt':r['body']['request'][:160]} for r in turns])[:limit*3], 'note':'每类结果有限额；开发记录与文档正文仅在已索引范围内搜索。'}
+    from . import knowledge
+    entries=[{'type':'knowledge','id':r['id'],'title':r['name'],'excerpt':r['path']} for r in knowledge.listing(q=q)['items'][:limit]]
+    return {'items':(projects+files+docs+entries+[{'type':'development','id':r['id'],'project_id':r['project_id'],'title':r['title'],'excerpt':r['body']['request'][:160]} for r in turns])[:limit*3], 'note':'每类结果有限额；开发记录与文档正文仅在已索引范围内搜索。'}
 
 @router.get('/api/development')
 def development(project:str='',q:str='',page:int=1,limit:int=30,path:str=''):

@@ -17,7 +17,26 @@ def main():
     target=sub.add_parser('configure-sync');target.add_argument('--host',required=True);target.add_argument('--root',required=True)
     sub.add_parser('set-password')
     backup=sub.add_parser('backup'); backup.add_argument('destination',type=Path)
+    v=sub.add_parser('vault');vs=v.add_subparsers(dest='operation',required=True)
+    vc=vs.add_parser('configure');vc.add_argument('--name',required=True);vc.add_argument('--repository',required=True);vc.add_argument('--root',action='append',default=[]);vc.add_argument('--codex-root',default='');vc.add_argument('--password-file');vc.add_argument('--no-projects',action='store_true');vc.add_argument('--no-catalog',action='store_true')
+    for action in ['init','plan','backup','verify','drill']:
+        vp=vs.add_parser(action);vp.add_argument('id')
+        if action=='verify':vp.add_argument('--full',action='store_true')
+    vs.add_parser('status');vs.add_parser('scan-knowledge');vs.add_parser('sync')
     args=p.parse_args(); db.init()
+    if args.command=='vault':
+        from . import vault,knowledge
+        progress=lambda n,t,d:print(json.dumps({'done':n,'total':t,'detail':d},ensure_ascii=False),flush=True)
+        if args.operation=='configure':result=vault.configure(args.name,args.repository,args.root,args.codex_root,not args.no_projects,not args.no_catalog,args.password_file)
+        elif args.operation=='init':result=vault.initialize(args.id)
+        elif args.operation=='plan':result=vault.plan(args.id)
+        elif args.operation=='backup':result=vault.backup(progress,args.id)
+        elif args.operation=='verify':result=vault.verify(progress,args.id,args.full)
+        elif args.operation=='drill':result=vault.drill(progress,args.id)
+        elif args.operation=='scan-knowledge':result=knowledge.scan(progress)
+        elif args.operation=='sync':result=vault.sync_metadata(progress)
+        else:result=vault.overview()
+        print(json.dumps(result,ensure_ascii=False,indent=2));return
     if args.command=='serve':
         import uvicorn
         uvicorn.run('asset_manager.server:app',host=args.host,port=args.port,proxy_headers=False)

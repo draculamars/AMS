@@ -129,6 +129,8 @@ def init(recover_jobs=False):
         con.execute("UPDATE assets SET kind='model' WHERE ext IN ('.brep','.usda','.usdc','.xacro','.fcstd','.sldasm','.sldprt','.f3d','.f3z','.iam','.ipt','.scad') AND kind<>'model'")
         if recover_jobs:
             con.execute("UPDATE jobs SET status='interrupted',detail='服务重启中断了任务，可重新执行' WHERE status IN ('queued','running')")
+    from . import vault
+    vault.init()
     blob_root().mkdir(parents=True, exist_ok=True)
     (DATA / 'tmp').mkdir(exist_ok=True)
     os.chmod(DATA, 0o700)

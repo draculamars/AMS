@@ -1,8 +1,8 @@
-# AMS · 工程资产管家
+# Atlas · 工程与知识管家（AMS）
 
 AMS 是可部署在 macOS、Ubuntu 的私人资产管理系统。它把项目文件、文档、模型、已有 Git 历史、资产快照和 Codex 开发记录放入同一个工作空间。浏览器可从桌面、平板和手机访问。
 
-**当前版本：0.4.1。** 每个服务实例展示自身节点的工作目录与已经完整接收的归档映射。机器名称、SSH 目标、存储位置均属于部署配置。
+**当前版本：0.5.0。** 每个服务实例展示自身节点的工作目录与已经完整接收的归档映射。机器名称、SSH 目标、存储位置均属于部署配置。
 
 ## 可以做什么
 
@@ -14,6 +14,11 @@ AMS 是可部署在 macOS、Ubuntu 的私人资产管理系统。它把项目文
 - **历史**：浏览已有 Git 分支、标签、提交、文件历史、差异和历史模型。读取历史不 checkout、commit 或 push 原仓库。
 - **管理与修改**：上传、下载、备注、标签、工程包更新；在线文本编辑先展示差异，确认后写入本节点原文件并保存前后快照。
 - **同步**：SSH 增量传输工程内容、索引、引用、开发记录和已有 Git 对象；校验内容后发布目标节点映射。
+
+- **备份与恢复**：加密增量保存 Codex 与工程原件，数据库一致性副本、覆盖清单、全量校验、隔离恢复与样本演练。
+- **技能与工具**：技能、规则、记忆、插件、工具配置和版本预览；脱敏清单可同步到归档节点。
+
+完整范围见 [备份与恢复](docs/BACKUP.md) 和 [功能规划](docs/ROADMAP.md)。
 
 ## 快速运行
 
@@ -57,7 +62,7 @@ export ASSET_BLOB_DIR="$HOME/AssetVault/archive"
 
 AMS 只读访问配置目录下的 Codex `state_5.sqlite` 与 `thread_history_1.sqlite`；若会话尚无 SQLite 投影，则从该目录内对应 JSONL 的公开事件补全。自动发现已配置且本机存在的 Codex 项目目录（只建立索引，不创建 Git 仓库），并关联工程路径。默认来源是 `~/.codex`，可用 `ASSET_CODEX_HOME` 或工作台设置替换。
 
-只收录用户消息、公开助手消息、文件变更事件与命令执行状态。不会读取认证文件、推理条目或执行记录中的命令。明显凭据会遮盖；开发记录仍属于私人数据，应保留在自己的部署与备份中。
+开发过程索引只收录用户消息、公开助手消息、文件变更事件与命令执行状态，不读取认证文件或推理条目，不执行记录中的命令。明显凭据会遮盖；开发记录仍属于私人数据，应保留在自己的部署与备份中。独立的原件备份按明确范围加密保存文件，不将认证内容暴露到索引预览。
 
 - 文件变更边有事件 ID、成功/失败状态、保存的差异。公开消息中的明确文件链接也会关联到产物，并单独标记为会话引用；引用不证明文件由该轮生成。
 - 多轮修改同一路径表示迭代顺序，不能直接证明一个设计派生于另一个设计。
@@ -92,6 +97,7 @@ AMS 只读访问配置目录下的 Codex `state_5.sqlite` 与 `thread_history_1.
 | `ASSET_SECURE_COOKIE` | HTTPS 部署设置为 `1` |
 | `ASSET_COOKIE_NAME` | 同一浏览器访问多个节点时可配置不同会话 cookie 名称 |
 | `ASSET_BLENDER` | 可选 Blender 可执行文件；也可通过 PATH 发现 |
+| `ATLAS_RESTIC` | 可选 Restic 路径；默认 PATH 或数据根目录相邻 `tools/restic` |
 
 ## SSH 同步
 
@@ -131,11 +137,13 @@ GitHub 仓库只存系统源码、通用说明与合成测试；运行数据库�
 
 ```bash
 .venv/bin/python -m pip install -r requirements-dev.txt
-ASSET_WATCH_ENABLED=0 .venv/bin/python -m pytest -q
+# 安装备份引擎后设置其绝对路径；否则真实加密集成测试会跳过
+ASSET_WATCH_ENABLED=0 ATLAS_RESTIC=/absolute/path/restic .venv/bin/python -m pytest -q
 npm ci
 npm run build:viewer
 # Playwright 由开发环境安装或通过 PLAYWRIGHT_MODULE 指向已有安装
 AMS_QA_URL=http://127.0.0.1:8765 node scripts/steward-browser-qa.cjs
+AMS_QA_URL=http://127.0.0.1:8765 node scripts/vault-browser-qa.cjs
 ```
 
 浏览器验收覆盖工作台、开发记录、目录范围和手机布局。Git、文件写入冲突、归档校验、同步发布、模型依赖等通过合成工程测试验证。

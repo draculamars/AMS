@@ -292,6 +292,9 @@ def main():
     elif mode=='import-development':
         from . import provenance
         with core.MUTATION_LOCK:result=provenance.receive_project(json.load(sys.stdin))
+    elif mode=='import-vault':
+        from . import vault
+        with core.MUTATION_LOCK:result=vault.receive_metadata(json.load(sys.stdin))
     else:raise ValueError('不支持的同步操作')
     print(json.dumps(result,ensure_ascii=False),flush=True)
 

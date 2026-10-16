@@ -3,7 +3,7 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
 const kinds={document:['文档资料','DOC'],model:['设计与模型','3D'],image:['图片资源','IMG'],data:['数据文件','DATA'],code:['代码与脚本','</>'],media:['音视频','AV'],archive:['压缩与安装包','ZIP'],other:['其他文件','FILE']};
 let workbenchScreen,projectScreen,modelScreen,assetModel,assetGeneration=0;
 const modelFormats=new Set(['.stl','.obj','.step','.stp','.iges','.igs','.brep','.3mf','.glb','.gltf','.urdf','.blend']);
-const titles={engineering:'工程空间',models:'模型工程',overview:'工作台',assets:'资产库',projects:'项目目录',archives:'归档与版本',governance:'Git 纳管',migration:'迁移规划',activity:'活动记录',settings:'设置与部署'};
+const titles={vault:'备份与恢复',knowledge:'技能与工具',engineering:'工程空间',models:'模型工程',overview:'工作台',assets:'资产库',projects:'项目目录',archives:'归档与版本',governance:'Git 纳管',migration:'迁移规划',activity:'活动记录',settings:'设置与部署'};
 let state={view:'overview',projects:[],stats:{},q:'',project:'',kind:'',status:'',sort:'recent',page:1,selected:new Set(),asset:null,version:null};
 let auth={}, timer,searchTimer,renderGeneration=0;
 const fmt=n=>Number(n||0).toLocaleString('zh-CN');
@@ -21,6 +21,7 @@ function table(items,selectable=false){if(!items.length)return '<div class="empt
 async function refreshBase(){const [stats,projects]=await Promise.all([api('/api/stats'),api('/api/projects')]);state.stats=stats;state.projects=projects;$('#nav-count').textContent=fmt(stats.assets);$('#pending-count').textContent=projects.filter(p=>p.git.state!=='versioned'&&p.assets).length;$('#storage-size').textContent=size(stats.blob_bytes)}
 async function render(){workbenchScreen?.dispose();workbenchScreen=null;projectScreen?.dispose();projectScreen=null;modelScreen?.dispose();modelScreen=null;const gen=++renderGeneration, view=state.view;$('#crumb').textContent=titles[view];$$('nav button').forEach(b=>b.classList.toggle('active',b.dataset.view===view));let html='';
  if(view==='overview'){const {mountWorkbench}=await import('/static/steward.js');if(gen!==renderGeneration)return;workbenchScreen=await mountWorkbench($('#view'),{api,toast,openAsset,upload:uploadForm,importProject:()=>action('import')});return}
+ if(view==='vault'||view==='knowledge'){const {mountVault}=await import('/static/vault.js');if(gen!==renderGeneration)return;workbenchScreen=await mountVault($('#view'),{api,toast,mode:view});return}
  if(view==='engineering'){const {mountProjects}=await import('/static/projects-ui.js');if(gen!==renderGeneration)return;$('#view').innerHTML='';projectScreen=mountProjects($('#view'),{api,openAsset,toast});await projectScreen.ready;return}
  if(view==='models'){const {mountModels}=await import('/static/models-ui.js');if(gen!==renderGeneration)return;$('#view').innerHTML='';modelScreen=mountModels($('#view'),{api,openAsset,toast,projects:state.projects,initialId:location.hash.split('/')[1]});await modelScreen.ready;return}
  if(view==='overview'){
