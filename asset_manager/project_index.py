@@ -106,6 +106,7 @@ def index_one(pid,progress=lambda *a:None,rescan=True):
     from . import node
     if not node.location(pid)['local_available']:raise ValueError('本节点保存的是归档映射或离线目录，请在来源节点更新后同步')
     if not Path(p['path']).is_dir():raise ValueError('此主机没有原项目目录。请在来源节点更新索引并同步，或绑定本节点目录。')
+    with db.connect() as c:c.execute('INSERT OR REPLACE INTO settings VALUES(?,?)',('watch_dirty:'+pid,'1'))
     if rescan:core.scan_project(pid)
     repo_count=git_history.discover(pid)
     assets=rows(pid);overrides=source_overrides(pid)
@@ -177,6 +178,7 @@ def index_one(pid,progress=lambda *a:None,rescan=True):
         c.execute('DELETE FROM project_documents WHERE project_id=?',(pid,));c.executemany('INSERT INTO project_documents VALUES(?,?,?,?,?)',documents)
         c.execute('INSERT INTO project_index_runs VALUES(?,?,?,?,?)',(ident,pid,created,json.dumps(state,ensure_ascii=False),name))
         c.execute('INSERT OR REPLACE INTO project_index_state VALUES(?,?,?)',(pid,json.dumps(state,ensure_ascii=False),created))
+        c.execute('DELETE FROM settings WHERE key=?',('watch_dirty:'+pid,))
         db.audit(c,'project_index',{'project_id':pid,**state})
     return state
 

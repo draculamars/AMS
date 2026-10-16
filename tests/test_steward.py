@@ -159,3 +159,16 @@ def test_rollout_public_event_fallback_skips_reasoning_and_syncs_session_metadat
     assert len(provenance.export_project('p')['development_sessions'])==2
     assert provenance.ingest()['sessions_updated']==0
     assert provenance.rollout_turns(tmp_path/'outside.jsonl',root,'t')==[]
+
+def test_interrupted_index_retries_after_file_metadata_was_updated(env,monkeypatch):
+    put(env,'notes.md','before');project_index.index_one('p');node.initialize();node.reconcile('p')
+    put(env,'notes.md','after interruption')
+    discover=project_index.git_history.discover
+    def crash(*args):raise RuntimeError('simulated interruption after filesystem scan')
+    monkeypatch.setattr(project_index.git_history,'discover',crash)
+    with pytest.raises(RuntimeError):project_index.index_one('p')
+    assert db.setting('watch_dirty:p')=='1'
+    monkeypatch.setattr(project_index.git_history,'discover',discover)
+    assert node.reconcile('p')['changed'] is True
+    assert db.setting('watch_dirty:p') is None
+    assert node.reconcile('p')['changed'] is False
