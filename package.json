@@ -1,0 +1,7 @@
+{
+  "name": "atlas-model-viewer",
+  "private": true,
+  "scripts": {"build:viewer": "node scripts/build-viewer.mjs"},
+  "dependencies": {"three": "0.186.1", "occt-import-js": "0.0.23"},
+  "devDependencies": {"esbuild": "0.28.2"}
+}

@@ -1,0 +1,11 @@
+{
+  "three": {
+    "version": "0.186.1",
+    "source": "https://github.com/mrdoob/three.js"
+  },
+  "occt": {
+    "version": "0.0.23",
+    "source": "https://github.com/kovacsv/occt-import-js",
+    "build_instructions": "https://github.com/kovacsv/occt-import-js#how-to-build-on-windows"
+  }
+}

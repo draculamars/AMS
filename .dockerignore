@@ -1,0 +1,5 @@
+*
+!requirements.lock
+!asset_manager/
+!asset_manager/**
+asset_manager/**/__pycache__

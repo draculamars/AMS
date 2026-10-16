@@ -1,0 +1,17 @@
+.venv/
+.runtime/
+.python/
+.tools/
+__pycache__/
+.pytest_cache/
+data/
+.env
+node_modules/
+*.log
+*.pyc
+*.sqlite*
+*.zip
+.env.*
+!.env.example
+.DS_Store
+RELEASE-MANIFEST.json

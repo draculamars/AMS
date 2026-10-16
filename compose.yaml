@@ -1,0 +1,40 @@
+services:
+  atlas:
+    build: .
+    restart: unless-stopped
+    user: "${ATLAS_UID:-1000}:${ATLAS_GID:-1000}"
+    environment:
+      ASSET_DATA_DIR: /data
+      ASSET_BLOB_DIR: /archive
+      ASSET_ALLOWED_HOSTS: "${DOMAIN},localhost,127.0.0.1"
+      ASSET_SECURE_COOKIE: "1"
+      ASSET_LOCAL_BOOTSTRAP: "0"
+      ASSET_MAX_UPLOAD_MB: "2048"
+    volumes:
+      - "${ASSET_ROOT}/catalog:/data"
+      - "${ASSET_ROOT}/archive:/archive"
+      # Keep the same absolute paths so existing Git metadata remains resolvable.
+      - "${PROJECTS_ROOT}:${PROJECTS_ROOT}"
+    expose:
+      - "8765"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      DOMAIN: "${DOMAIN}"
+      ACME_EMAIL: "${ACME_EMAIL}"
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+volumes:
+  caddy_data:
+  caddy_config:

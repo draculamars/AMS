@@ -1,0 +1,25 @@
+[Unit]
+Description=Atlas local asset catalogue
+After=network.target
+
+[Service]
+Type=simple
+User=atlas
+Group=atlas
+WorkingDirectory=/opt/atlas
+Environment=ASSET_DATA_DIR=/srv/asset-vault/catalog
+Environment=ASSET_BLOB_DIR=/srv/asset-vault/archive
+Environment=ASSET_ALLOWED_HOSTS=127.0.0.1,localhost,assets.example.com
+Environment=ASSET_SECURE_COOKIE=1
+Environment=ASSET_LOCAL_BOOTSTRAP=0
+ExecStart=/opt/atlas/.venv/bin/python -m asset_manager serve --host 127.0.0.1 --port 8765
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/srv/asset-vault
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
