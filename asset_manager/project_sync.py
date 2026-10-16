@@ -289,6 +289,9 @@ def main():
     elif mode=='receive-git':result=receive_git(sys.argv[2])
     elif mode=='import':
         with core.MUTATION_LOCK:result=import_payload(json.load(sys.stdin))
+    elif mode=='import-development':
+        from . import provenance
+        with core.MUTATION_LOCK:result=provenance.receive_project(json.load(sys.stdin))
     else:raise ValueError('不支持的同步操作')
     print(json.dumps(result,ensure_ascii=False),flush=True)
 

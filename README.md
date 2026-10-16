@@ -102,6 +102,8 @@ AMS 只读访问配置目录下的 Codex `state_5.sqlite` 与 `thread_history_1.
 .venv/bin/python -m asset_manager sync
 # 可选：只同步一个项目
 .venv/bin/python -m asset_manager sync --project example-project
+# 工程已同步后，只更新开发记录，无需重新传输或扫描大工程
+.venv/bin/python -m asset_manager sync-development
 ```
 
 可从网页触发同步。目标完成内容验证和目录事务后才发布新映射。失败任务可重试，已接收的内容对象复用；不会自动清理历史副本。网络断开不影响浏览已有归档。同步没有隐含的定时上传任务。

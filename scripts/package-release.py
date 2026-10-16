@@ -3,6 +3,7 @@
 import hashlib
 import json
 import sys
+import subprocess
 import zipfile
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
@@ -17,7 +18,8 @@ for path in root.rglob('*'):
     rel=path.relative_to(root)
     if path.is_symlink() or not path.is_file() or '__pycache__' in rel.parts:continue
     if (len(rel.parts)==1 and rel.name in files) or rel.parts[0] in folders:selected.append((path,rel.as_posix()))
-manifest={'version':__version__,'files':{}}
+revision=subprocess.run(['git','-C',str(root),'rev-parse','HEAD'],capture_output=True,text=True)
+manifest={'version':__version__,'source_commit':revision.stdout.strip() if revision.returncode==0 else None,'files':{}}
 with zipfile.ZipFile(target,'w',zipfile.ZIP_DEFLATED,compresslevel=6) as z:
     for path,rel in sorted(selected):
         manifest['files'][rel]=hashlib.sha256(path.read_bytes()).hexdigest();z.write(path,rel)

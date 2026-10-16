@@ -182,3 +182,34 @@ def discover_projects():
         existing.add(str(path))
     if found:core.import_projects({'projects':found})
     return len(found)
+
+def receive_project(data):
+    """Publish development metadata independently of large engineering contents."""
+    pid=data['project_id'];payload=data['development']
+    schema={'development_sessions':{'id','project_id','title','body','updated_at'},
+            'development_turns':{'id','session_id','project_id','started_at','body'},
+            'development_artifacts':{'id','turn_id','project_id','path','action','body'}}
+    with db.connect() as c:
+        if not c.execute('SELECT 1 FROM projects WHERE id=?',(pid,)).fetchone():raise ValueError('请先同步工程，再同步开发记录')
+        for table,columns in schema.items():
+            for row in payload.get(table,[]):
+                if set(row)!=columns:raise ValueError('开发记录字段无效')
+                if not isinstance(json.loads(row['body']),dict):raise ValueError('开发记录内容无效')
+                keys=list(row)
+                c.execute('INSERT OR REPLACE INTO '+table+'('+','.join(keys)+') VALUES('+','.join('?' for _ in keys)+')',[row[k] for k in keys])
+        state={'status':'synced','checked_at':core.now(),'source_node':data.get('source_node',{}).get('label','来源节点')}
+        c.execute("INSERT OR REPLACE INTO settings VALUES('provenance_status',?)",(json.dumps(state),))
+        db.audit(c,'development_sync_received',{'project_id':pid,'turns':len(payload.get('development_turns',[]))})
+    return {'project_id':pid,'turns':len(payload.get('development_turns',[]))}
+
+def sync(progress=lambda *a:None,pid=None):
+    from . import node,project_sync
+    cfg=project_sync.config();ingest(progress)
+    with db.connect() as c:
+        projects=[r[0] for r in c.execute("SELECT p.id FROM projects p JOIN project_locations l ON l.project_id=p.id WHERE l.mode='workspace'"+(' AND p.id=?' if pid else ''),(pid,) if pid else ())]
+    results=[]
+    for i,project in enumerate(projects):
+        progress(i,len(projects),'同步开发记录')
+        results.append(project_sync.remote_json(cfg,'import-development',payload={'project_id':project,'source_node':node.identity(),'development':export_project(project)}))
+    progress(len(projects),len(projects),'开发记录同步完成')
+    return {'projects':results}

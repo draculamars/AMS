@@ -116,3 +116,22 @@ def test_mutation_lock_serializes_other_processes(env,tmp_path):
         assert marker.read_text()=='acquired'
     finally:
         if child and child.poll() is None:child.terminate();child.wait()
+
+def test_explicit_conversation_file_links_are_not_modification_proof(env,tmp_path):
+    put(env,'bracket.stl','solid bracket\nendsolid');core.scan_project('p')
+    turn={'status':'completed','completed_at':100,'duration_ms':20};session={'cwd':str(env)}
+    item={'type':'agentMessage','phase':'final','text':'See [model](bracket.stl) and `unrelated.stl`.'}
+    body,artifacts=provenance.parse_turn(turn,[{'item_id':'message','item_json':json.dumps(item)}],session,[{'id':'p','path':str(env)}],{('p','bracket.stl')})
+    assert len(artifacts)==1 and artifacts[0]['action']=='mentioned'
+    assert artifacts[0]['body']['status']=='referenced' and artifacts[0]['body']['diff']==''
+
+def test_development_metadata_sync_is_idempotent_and_preserves_assets(env,tmp_path):
+    put(env,'notes.md','original');core.scan_project('p');history_source(tmp_path,env);provenance.ingest()
+    data={'project_id':'p','development':provenance.export_project('p')}
+    with db.connect() as c:before=[dict(r) for r in c.execute('SELECT * FROM assets')]
+    assert provenance.receive_project(data)['turns']==1
+    assert provenance.receive_project(data)['turns']==1
+    with db.connect() as c:
+        assert [dict(r) for r in c.execute('SELECT * FROM assets')]==before
+        assert c.execute('SELECT COUNT(*) FROM development_turns').fetchone()[0]==1
+    with pytest.raises(ValueError,match='先同步工程'):provenance.receive_project({**data,'project_id':'absent'})

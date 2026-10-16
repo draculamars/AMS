@@ -13,6 +13,7 @@ def main():
     arc=sub.add_parser('archive'); arc.add_argument('--project'); arc.add_argument('--artifacts-only',action='store_true')
     structure=sub.add_parser('index');structure.add_argument('--project')
     sync=sub.add_parser('sync');sync.add_argument('--project')
+    dev=sub.add_parser('sync-development');dev.add_argument('--project')
     target=sub.add_parser('configure-sync');target.add_argument('--host',required=True);target.add_argument('--root',required=True)
     sub.add_parser('set-password')
     backup=sub.add_parser('backup'); backup.add_argument('destination',type=Path)
@@ -26,6 +27,9 @@ def main():
         from . import project_index,project_sync
         worker=project_index.index_all if args.command=='index' else project_sync.synchronize
         with core.MUTATION_LOCK:print(json.dumps(worker(lambda n,t,d:print(f'{n}/{t} {d}',flush=True),args.project),ensure_ascii=False))
+    elif args.command=='sync-development':
+        from . import provenance
+        with core.MUTATION_LOCK:print(json.dumps(provenance.sync(lambda n,t,d:print(f'{n}/{t} {d}',flush=True),args.project),ensure_ascii=False))
     elif args.command=='archive':
         with db.connect() as con:
             query="SELECT id FROM assets WHERE present=1 AND NOT EXISTS(SELECT 1 FROM versions WHERE asset_id=assets.id)"
