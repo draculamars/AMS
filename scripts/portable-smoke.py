@@ -20,6 +20,9 @@ def main(destination):
     source.mkdir()
     project=source/'project';project.mkdir();(project/'README.md').write_text('# Portable runtime check\n')
     (project/'part.stl').write_text('solid part\nfacet normal 0 0 1\nouter loop\nvertex 0 0 0\nvertex 1 0 0\nvertex 0 1 0\nendloop\nendfacet\nendsolid part\n')
+    subprocess.run(['git','init','-b','main',str(project)],check=True,capture_output=True)
+    subprocess.run(['git','-C',str(project),'add','.'],check=True)
+    subprocess.run(['git','-C',str(project),'-c','user.name=Atlas fixture','-c','user.email=fixture@example.invalid','commit','-m','Portable fixture'],check=True,capture_output=True)
     env={**os.environ,'ASSET_DATA_DIR':str(source/'catalog'),'ASSET_BLOB_DIR':str(source/'archive'),'ASSET_WATCH_ENABLED':'0'}
     manifest=source/'projects.json';manifest.write_text(json.dumps({'projects':[{'projectId':'portable-fixture','name':'Portable fixture','path':str(project)}]}))
     subprocess.run([sys.executable,'-m','asset_manager','import',str(manifest)],cwd=APP,env=env,check=True)
@@ -52,6 +55,10 @@ def main(destination):
                 assert len(r.read())==asset['size']
         with opener.open(url+'/api/engineering/portable-fixture/tree') as r:
             assert json.load(r)['total']==2
+        with opener.open(url+'/api/engineering/portable-fixture') as r:
+            repository=json.load(r)['repositories'][0]['repository_id']
+        with opener.open(url+'/api/repositories/'+repository+'/commits') as r:
+            assert json.load(r)['items'][0]['subject']=='Portable fixture'
         subprocess.run(['sh',str(target/'stop.sh')],env=env,check=True,timeout=90)
         proc.wait(timeout=30)
         subprocess.run(['sh',str(target/'start.sh'),'verify'],env=env,check=True)

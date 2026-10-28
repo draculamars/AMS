@@ -43,6 +43,8 @@ fi
 export ATLAS_RUNTIME_DIR="$DEST"
 export PATH="$DEST/git/bin:$PATH"
 if [ "$SYSTEM" = Linux ]; then
-  export LD_LIBRARY_PATH="$DEST/git/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  export LD_LIBRARY_PATH="$DEST/git/lib:$DEST/python/lib"
+else
+  unset DYLD_LIBRARY_PATH DYLD_FALLBACK_LIBRARY_PATH
 fi
 exec "$DEST/python/bin/python3.12" -I "$ROOT/launcher.py" "$ROOT" "${1:-start}" "${2:-}"
