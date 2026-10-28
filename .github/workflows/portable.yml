@@ -1,0 +1,23 @@
+name: Portable runtimes
+on:
+  push:
+    branches: [codex/portable-vault]
+  workflow_dispatch:
+jobs:
+  runtime:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install uv -r requirements.lock
+      - run: python scripts/portable-smoke.py "${{ runner.temp }}/AtlasPortable"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: atlas-portable-${{ matrix.os }}
+          path: ${{ runner.temp }}/AtlasPortable moved 空间

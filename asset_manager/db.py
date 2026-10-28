@@ -95,10 +95,13 @@ CREATE TABLE IF NOT EXISTS project_preferences(project_id TEXT PRIMARY KEY, favo
 
 @contextlib.contextmanager
 def connect():
+    portable_storage_check()
     DATA.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DATA / 'catalog.sqlite3', timeout=60)
     con.row_factory = sqlite3.Row
     con.execute('PRAGMA foreign_keys=ON')
+    if os.environ.get('ATLAS_PORTABLE_ROOT'):
+        con.execute('PRAGMA synchronous=FULL')
     try:
         yield con
         con.commit()
@@ -109,11 +112,20 @@ def connect():
         con.close()
 
 def blob_root():
+    portable_storage_check()
     return Path(os.environ.get('ASSET_BLOB_DIR', DATA / 'blobs')).expanduser().resolve()
+
+def portable_storage_check():
+    root=os.environ.get('ATLAS_PORTABLE_ROOT')
+    expected=os.environ.get('ATLAS_PORTABLE_DEVICE')
+    if root and expected:
+        base=Path(root)
+        if not (base/'portable.json').is_file() or str(base.stat().st_dev)!=expected:
+            raise FileNotFoundError('便携磁盘已断开；停止访问，避免在接入主机创建替代目录')
 
 def init(recover_jobs=False):
     with connect() as con:
-        con.execute('PRAGMA journal_mode=WAL')
+        con.execute('PRAGMA journal_mode='+('DELETE' if os.environ.get('ATLAS_PORTABLE_ROOT') else 'WAL'))
         con.executescript(SCHEMA)
         old_sql=con.execute("SELECT sql FROM sqlite_master WHERE name='versions'").fetchone()[0]
         if 'UNIQUE(asset_id,sha256,reason)' in old_sql:

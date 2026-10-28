@@ -54,6 +54,9 @@ async def protection(request,call_next):
     if host not in allowed:
         return JSONResponse({'detail':'主机名未获授权，请配置 ASSET_ALLOWED_HOSTS'},400)
     path=request.url.path
+    from . import portable
+    if portable.enabled() and not portable.request_allowed(request.method,path):
+        return JSONResponse({'detail':'便携副本仅管理盘内资产；原项目扫描、路径绑定、Git 写入和原件备份请在原部署中操作。'},409)
     if request.method not in {'GET','HEAD','OPTIONS'}:
         origin=request.headers.get('origin')
         if origin and urlsplit(origin).netloc.lower()!=request.headers.get('host','').lower():
@@ -101,7 +104,29 @@ async def missing_error(request,error):
     return JSONResponse({'detail':str(error)},404)
 
 @app.get('/api/health')
-def health(): return {'status':'ok','version':__version__}
+def health():
+    value={'status':'ok','version':__version__}
+    if os.environ.get('ATLAS_PORTABLE_ROOT'):
+        value['portable_session']=os.environ.get('ATLAS_PORTABLE_SESSION','')
+        value['portable_pid']=os.getpid()
+    return value
+
+@app.get('/api/portable')
+def portable_status():
+    from . import portable
+    return portable.status()
+
+@app.post('/api/portable/stop')
+def portable_stop():
+    from . import portable
+    if not portable.enabled() or not os.environ.get('ATLAS_PORTABLE_SESSION'):
+        raise HTTPException(409,'当前不是便携启动会话')
+    with db.connect() as con:
+        if con.execute("SELECT 1 FROM jobs WHERE status IN ('queued','running') LIMIT 1").fetchone():
+            raise HTTPException(409,'请等待当前上传、归档或模型预览任务完成后再停止')
+    import signal
+    return JSONResponse({'status':'stopping','message':'正在关闭并保存目录库，请等待启动终端显示完成后再弹出磁盘。'},
+                        background=BackgroundTask(os.kill,os.getpid(),signal.SIGTERM))
 
 @app.get('/api/auth/status')
 def auth_status(request:Request):

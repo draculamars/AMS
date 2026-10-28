@@ -1,5 +1,12 @@
 # Changelog
 
+## Portable branch (based on 0.5.1)
+
+- Independent removable-disk deployment, offline platform runtimes, content export and full verification tools.
+- Portable scope guards, archived Git preference, mount relocation, single-instance launch and checked shutdown backups.
+- Storage persistence preflight rejects disappearing writes; deployment success is recorded separately from code and runtime tests.
+- Main deployment defaults and the core roadmap remain unchanged.
+
 ## 0.5.1 — 2026-10-17
 
 - 技能符号链接入口在已授权来源内建立索引，并显示实际路径。

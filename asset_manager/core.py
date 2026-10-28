@@ -215,6 +215,8 @@ def source_path(asset_id, version=None):
         if not path.is_file():
             raise FileNotFoundError('归档文件缺失，请从备份恢复')
         return path,a
+    if os.environ.get('ATLAS_PORTABLE_ROOT'):
+        raise FileNotFoundError('此资产的内容未包含在便携副本中；不会读取接入电脑的原路径')
     try:
         return safe_path(a['project_path'],a['relpath']),a
     except FileNotFoundError:
@@ -322,7 +324,7 @@ def run_job(kind, function, *args):
         except Exception as e:
             with db.connect() as con:
                 con.execute("UPDATE jobs SET status='failed',detail=? WHERE id=?",(str(e)[:2000],jid))
-    threading.Thread(target=work,daemon=True).start()
+    threading.Thread(target=work,daemon=True,name='atlas-job-'+jid).start()
     return jid
 
 def scan_all(progress,project_id=None):

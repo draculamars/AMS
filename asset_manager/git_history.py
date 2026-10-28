@@ -99,7 +99,7 @@ def repository(rid):
     if not archived or not archived.is_dir():
         candidate=db.DATA/'git-history'/'objects'/r['metadata']['fingerprint']
         if candidate.is_dir():archived=candidate
-    if not snapshot and Path(r['source_root']).is_dir():r['location']=r['source_root'];r['source']='local'
+    if not os.environ.get('ATLAS_PORTABLE_ROOT') and not snapshot and Path(r['source_root']).is_dir():r['location']=r['source_root'];r['source']='local'
     elif archived and archived.is_dir():r['location']=str(archived);r['source']='archive'
     else:raise FileNotFoundError('仓库历史尚未同步到当前主机；文件归档仍可浏览')
     return r

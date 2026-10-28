@@ -37,6 +37,8 @@ def source_overrides(pid):
 
 
 def source_for(a,root,overrides):
+    if os.environ.get('ATLAS_PORTABLE_ROOT'):
+        return core.source_path(a['id'])[0]
     sha=overrides.get(a['id']) or (a.get('archived_sha') if not a['present'] else None)
     if sha:
         source=db.blob_root()/sha[:2]/sha
@@ -242,7 +244,10 @@ def overview(pid):
     with db.connect() as c:
         s=c.execute('SELECT * FROM project_index_state WHERE project_id=?',(pid,)).fetchone()
         repos=[{**dict(r),'metadata':json.loads(r['body'])} for r in c.execute('SELECT pr.*,r.body,r.archive_path,r.archive_at,r.indexed_at FROM project_repositories pr JOIN repositories r ON r.id=pr.repository_id WHERE pr.project_id=? ORDER BY CASE pr.role WHEN \'主仓库\' THEN 0 WHEN \'子仓库\' THEN 1 ELSE 2 END,pr.prefix',(pid,))]
-        for r in repos:r.pop('body');r['available']=Path(r['checkout_root']).is_dir() or bool(r['archive_path'] and Path(r['archive_path']).is_dir())
+        for r in repos:
+            r.pop('body')
+            archived=db.DATA/'git-history'/'objects'/r['metadata']['fingerprint']
+            r['available']=archived.is_dir() or (not os.environ.get('ATLAS_PORTABLE_ROOT') and Path(r['checkout_root']).is_dir()) or bool(r['archive_path'] and Path(r['archive_path']).is_dir())
         for r in repos:r['archives']=[dict(x) for x in c.execute('SELECT fingerprint,created_at FROM repository_archives WHERE repository_id=? ORDER BY created_at DESC',(r['repository_id'],))]
         counts=dict(c.execute('SELECT COUNT(*) files,COALESCE(SUM(size),0) bytes FROM assets a WHERE project_id=? AND '+models.available_sql(),(pid,)).fetchone())
         kinds=[dict(r) for r in c.execute('SELECT kind,COUNT(*) count FROM assets a WHERE project_id=? AND '+models.available_sql()+' GROUP BY kind',(pid,))]
