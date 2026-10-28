@@ -96,6 +96,8 @@ def repository(rid):
         r.update(body=s['body'],archive_path=s['archive_path'],archive_at=s['created_at'])
     r['id']=original_id;r['metadata']=json.loads(r.pop('body'))
     archived=Path(r['archive_path']) if r.get('archive_path') else None
+    if os.environ.get('ATLAS_PORTABLE_ROOT'):
+        archived=db.DATA/'git-history'/'objects'/r['metadata']['fingerprint']
     if not archived or not archived.is_dir():
         candidate=db.DATA/'git-history'/'objects'/r['metadata']['fingerprint']
         if candidate.is_dir():archived=candidate

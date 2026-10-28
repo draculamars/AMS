@@ -52,7 +52,7 @@ Mac 默认将运行包展开到专用目录中的 `runtimes/expanded`，避免�
 
 ## 构建、导出与升级
 
-构建机需要 Python 3.12、uv、curl、Git；Mac 运行包还需要一份只依赖系统库的 macOS universal Git。官方 Python 构建包按发布方 SHA256SUMS 验证，Ubuntu Git 包按官方软件包索引 SHA-256 验证，来源与许可证随包保存。
+构建机需要 Python 3.12、uv、curl、Git、zstd；Mac 运行包还需要一份只依赖系统库的 macOS universal Git。官方 Python 构建包按发布方 SHA256SUMS 验证，Ubuntu Git 包按官方软件包索引 SHA-256 验证，来源与许可证随包保存。
 
 ```bash
 python scripts/export-portable.py /新磁盘/AtlasPortable \

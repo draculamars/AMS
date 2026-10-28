@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build offline macOS/Ubuntu runtime archives without executing foreign binaries.
 
-Requires a build host with Python 3.12, uv, curl and a macOS Git binary for Mac
+Requires a build host with Python 3.12, uv, curl, zstd and a macOS Git binary for Mac
 targets. Builds only inside the marked export directory. Sources and SHA-256
 receipts are saved alongside the archives. End users need none of these tools.
 """
@@ -98,6 +98,10 @@ def deb_data(path):
         size = int(raw[offset + 48:offset + 58])
         data = raw[offset + 60:offset + 60 + size]
         if name.startswith('data.tar'):
+            if name.endswith('.zst'):
+                if not shutil.which('zstd'):
+                    raise ValueError('Runtime build requires zstd to decode Ubuntu packages')
+                data=subprocess.run(['zstd','--decompress','--stdout'],input=data,capture_output=True,check=True).stdout
             return tarfile.open(fileobj=io.BytesIO(data), mode='r:*')
         offset += 60 + size + size % 2
     raise ValueError('Missing Debian data archive')

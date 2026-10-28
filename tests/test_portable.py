@@ -203,3 +203,26 @@ def test_disconnected_portable_volume_refuses_new_database(env,monkeypatch,tmp_p
     with pytest.raises(FileNotFoundError,match='磁盘已断开'):
         with db.connect():pass
     assert not db.DATA.exists()
+
+
+def test_ubuntu_zstd_deb_and_runtime_symlink_materialization(tmp_path):
+    if not shutil.which('zstd'):pytest.skip('build-time zstd not installed')
+    import io,tarfile
+    spec=importlib.util.spec_from_file_location('portable_builder',ROOT/'scripts/build-portable-runtimes.py')
+    builder=importlib.util.module_from_spec(spec);spec.loader.exec_module(builder)
+    stream=io.BytesIO()
+    with tarfile.open(fileobj=stream,mode='w') as t:
+        member=tarfile.TarInfo('./usr/bin/git');member.size=3;t.addfile(member,io.BytesIO(b'git'))
+    compressed=subprocess.run(['zstd','--compress','--stdout'],input=stream.getvalue(),capture_output=True,check=True).stdout
+    header=('data.tar.zst/'.ljust(16)+'0'.ljust(12)+'0'.ljust(6)+'0'.ljust(6)+'100644'.ljust(8)+str(len(compressed)).ljust(10)+'`\n').encode()
+    assert len(header)==60
+    deb=tmp_path/'git.deb';deb.write_bytes(b'!<arch>\n'+header+compressed+(b'\n' if len(compressed)%2 else b''))
+    with builder.deb_data(deb) as t:assert t.extractfile('./usr/bin/git').read()==b'git'
+    original=tmp_path/'runtime.tar';flattened=tmp_path/'flat.tar'
+    with tarfile.open(original,'w') as t:
+        member=tarfile.TarInfo('python/bin/python3.12');member.size=3;member.mode=0o755;t.addfile(member,io.BytesIO(b'bin'))
+        link=tarfile.TarInfo('python/bin/python3');link.type=tarfile.SYMTYPE;link.linkname='python3.12';t.addfile(link)
+    with tarfile.open(original) as src,tarfile.open(flattened,'w') as out:builder.regularized(src,out)
+    with tarfile.open(flattened) as t:
+        assert t.getmember('python/bin/python3').isfile()
+        assert t.extractfile('python/bin/python3').read()==b'bin'
