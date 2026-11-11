@@ -68,7 +68,7 @@ def analyze(path,raw,available):
         refs.append({**r,'target':target,'status':status})
     api=bool(re.search(r'''(?:fetch|WebSocket|EventSource)\s*\(\s*['"](?:https?://|/api|/ws)''',raw))
     kind='service' if api else 'interactive' if d.scripts else 'document'
-    if any(x in PurePosixPath(path).parts for x in ['sources','references','research']):kind='reference'
+    if any(x in PurePosixPath(path).parts for x in ['sources','references','research','SourcePackages','site-packages','docsets','vendor']):kind='reference'
     return {'title':''.join(d.title).strip()[:240] or PurePosixPath(path).stem,'kind':kind,
             'references':refs[:500],'references_truncated':len(refs)>500,'has_scripts':d.scripts,'has_base':d.base,
             'coverage':'HTML 直接引用；动态请求、JS/CSS 深层依赖和运行环境需另行验证',
@@ -90,6 +90,12 @@ def discover():
                 raw=core.source_path(a['id'])[0].read_text(errors='replace');body=analyze(a['relpath'],raw,available)
                 with db.connect() as c:
                     body['sessions']=[dict(x) for x in c.execute('SELECT DISTINCT s.id,s.title FROM development_artifacts a JOIN development_turns t ON t.id=a.turn_id JOIN development_sessions s ON s.id=t.session_id WHERE a.project_id=? AND a.path=? LIMIT 20',(p['id'],a['relpath']))]
+                    body['session_evidence']='indexed_file_event' if body['sessions'] else None
+                    if not body['sessions']:
+                        for part in PurePosixPath(a['relpath']).parts:
+                            if re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}',part):
+                                session=c.execute('SELECT id,title FROM development_sessions WHERE id=?',(part,)).fetchone()
+                                if session:body['sessions'].append(dict(session));body['session_evidence']='matching_session_directory'
                     ident=hashlib.sha256((p['id']+'\0'+a['relpath']).encode()).hexdigest()[:24]
                     c.execute('INSERT INTO web_entries VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,kind=excluded.kind,body=excluded.body,updated_at=excluded.updated_at',(ident,p['id'],a['relpath'],body['title'],body['kind'],json.dumps(body,ensure_ascii=False),core.now()))
                 out.append(ident)
@@ -138,7 +144,8 @@ def listing(q='',project='',kind='',page=1,limit=40):
     args=(project,project,kind,kind,q,'%'+q+'%','%'+q+'%')
     with db.connect() as c:
         total=c.execute('SELECT count(*) FROM web_entries e'+where,args).fetchone()[0]
-        rows=[dict(r) for r in c.execute('SELECT e.*,p.name project_name FROM web_entries e JOIN projects p ON p.id=e.project_id'+where+' ORDER BY e.updated_at DESC,e.path LIMIT ? OFFSET ?',(*args,limit,(page-1)*limit))]
+        order=" ORDER BY EXISTS(SELECT 1 FROM web_publications w WHERE w.entry_id=e.id AND json_extract(w.body,'$.verification')='browser_verified') DESC,CASE e.kind WHEN 'interactive' THEN 0 WHEN 'service' THEN 1 WHEN 'document' THEN 2 ELSE 3 END,e.updated_at DESC,e.path LIMIT ? OFFSET ?"
+        rows=[dict(r) for r in c.execute('SELECT e.*,p.name project_name FROM web_entries e JOIN projects p ON p.id=e.project_id'+where+order,(*args,limit,(page-1)*limit))]
         for row in rows:
             row['body']=json.loads(row['body'])
             pubs=[{**dict(r),'body':json.loads(r['body'])} for r in c.execute('SELECT * FROM web_publications WHERE entry_id=? ORDER BY created_at DESC',(row['id'],))]

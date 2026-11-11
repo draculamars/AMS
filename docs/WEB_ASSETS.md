@@ -52,6 +52,8 @@
 
 合成测试覆盖历史冻结、缺失归档不退回原目录、路径越界、错误签名、管理接口隔离及缺失依赖报告。真实验收在目标节点或其隧道进行；原工程不可访问仍可浏览才计为迁移验证。网页可打开不等于模型通过制造验收。
 
+模型库浏览验收脚本为 `scripts/web-model-browser-qa.cjs`。设置 `PLAYWRIGHT_MODULE`、`ATLAS_QA_URL`、`ATLAS_QA_OUTPUT` 和 `ATLAS_WEB_CASES`；使用已安装 Chrome 时设置 `ATLAS_BROWSER_CHANNEL=chrome`。用例 JSON 包含 `entry_path`、`expected_cards` 和 `models` 数组，每个模型声明 `title`、预期 `status` 文字及可选 `download_sha256`。脚本保存截图、所测模型及限制，访问凭证不会写入报告。
+
 ## 节点部署与备份
 
 源节点用 `configure-sync --host USER@HOST --root /absolute/AssetVault` 配置目标，实例地址不写入应用代码。传输源包后，目标依次安装锁定依赖、运行 `scripts/install-release.py` 和 `scripts/install-service.py`。使用回环监听配合 `scripts/open-tunnel.sh` 访问；公网部署另行配置身份验证和 HTTPS。
