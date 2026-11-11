@@ -1,11 +1,23 @@
 # Changelog
 
-## Portable branch (based on 0.5.1)
+## Portable branch (based on 0.6.0)
 
 - Independent removable-disk deployment, offline platform runtimes, content export and full verification tools.
 - Portable scope guards, archived Git preference, mount relocation, single-instance launch and checked shutdown backups.
 - Storage persistence preflight rejects disappearing writes; deployment success is recorded separately from code and runtime tests.
 - Main deployment defaults and the core roadmap remain unchanged.
+
+## 0.6.0 — 2026-11-11
+
+- 独立网页资产目录：工程、来源会话、直接引用、不可变发布历史及验证状态。
+- 限时签名和浏览器隔离的固定版本预览，保持相对路径；缺失对象不回退原目录。
+- 模型库目录冻结适配器，保留原应用、工程文件、已有交付包及离线渲染依赖。
+- 服务备份包含网页清单及适配生成的独立对象；新增迁移、权限和恢复测试。
+- Token 看板、SpaceLens、Atlas 保持独立运行，不合并服务、数据或仓库。
+- 修复 Linux 用户服务 WorkingDirectory 的引号格式，完成 Ubuntu 实际启动验证。
+- 对齐本地扫描、监视与接收端的受保护目录规则，避免索引纳入后又在整工程发布时拒绝；传输前提前验证路径。
+- 大型 HTML 仍进入网页目录，仅限制解析长度；保留完整内容和分析范围提示。
+- 扩大备份范围时复用同一配置上次完整且仍存在的恢复点，避免默认路径分组导致重新读取全部内容。
 
 ## 0.5.1 — 2026-10-17
 

@@ -86,7 +86,7 @@ def safe_path(root, relative, must_exist=True):
     target = current.resolve()
     if not target.is_relative_to(base) or target.is_relative_to(db.DATA) or target.is_relative_to(db.blob_root()) or target.is_relative_to(LOCAL_BUILD_DATA):
         raise ValueError('路径越界或指向系统数据目录')
-    if any(x in EXCLUDE_DIRS for x in rel.parts) or secret(target):
+    if any(x in EXCLUDE_DIRS or secret(x) for x in rel.parts):
         raise ValueError('该路径不在可管理资产范围内')
     if must_exist and (not target.is_file() or not stat.S_ISREG(target.stat().st_mode)):
         raise FileNotFoundError('源文件已离线或不存在')
@@ -146,7 +146,7 @@ def scan_project(pid):
         kept=[]
         for d in dirs:
             child=base/d
-            if d in EXCLUDE_DIRS or child.is_symlink() or any(child.resolve().is_relative_to(x) for x in (db.DATA, db.blob_root(), LOCAL_BUILD_DATA)):
+            if d in EXCLUDE_DIRS or secret(d) or child.is_symlink() or any(child.resolve().is_relative_to(x) for x in (db.DATA, db.blob_root(), LOCAL_BUILD_DATA)):
                 excluded[d] += 1
             else:
                 kept.append(d)

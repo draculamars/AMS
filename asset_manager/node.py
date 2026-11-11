@@ -73,7 +73,7 @@ def filesystem_state(p):
     def onerror(error):raise error
     for directory,dirs,names in os.walk(root,followlinks=False,onerror=onerror):
         base=Path(directory);directories.add(base.relative_to(root).as_posix())
-        dirs[:]=sorted(d for d in dirs if d not in core.EXCLUDE_DIRS and not (base/d).is_symlink() and not any((base/d).is_relative_to(x) for x in excluded))
+        dirs[:]=sorted(d for d in dirs if d not in core.EXCLUDE_DIRS and not core.secret(d) and not (base/d).is_symlink() and not any((base/d).is_relative_to(x) for x in excluded))
         for name in names:
             path=base/name
             if name=='.git' or core.secret(path) or path.is_symlink():continue

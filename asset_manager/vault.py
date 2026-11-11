@@ -237,6 +237,15 @@ def backup(progress,pid):
             body.update(report,phase='backup',stage_path=str(folder));save_snapshot(sid,p,'running',body,created)
             excludes=folder/'exclude.txt';excludes.write_text('\n'.join(literal(x) for x in report['excluded'])+'\n')
             args=['backup','--host',p['node_id'],'--tag','atlas','--tag','profile:'+pid,'--tag','receipt:'+sid,'--exclude-file',str(excludes)]
+            # Expanded source roots should reuse this profile's last complete
+            # snapshot. Restic's default host+paths grouping otherwise rescans
+            # all content even when only a publication directory was added.
+            with db.connect() as c:
+                previous=c.execute("SELECT body FROM vault_snapshots WHERE profile_id=? AND status='complete' ORDER BY created_at DESC LIMIT 1",(pid,)).fetchone()
+            parent=json.loads(previous[0]).get('restic_snapshot') if previous else None
+            if parent and re.fullmatch(r'[0-9a-f]{64}',parent):
+                available,_,_=run(p,['cat','snapshot',parent])
+                if available==0:args+=['--parent',parent];body['parent_snapshot']=parent
             # Database copies are separate sources when the catalog itself is not selected.
             args += ['--']+report['roots']+[str(folder)]
             last=[0]

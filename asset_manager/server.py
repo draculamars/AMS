@@ -78,7 +78,10 @@ async def protection(request,call_next):
     request.state.local=local
     request.state.authenticated=authenticated
     request.state.setup=not pw
-    public=path in {'/api/auth/status','/api/auth/login','/api/auth/setup','/api/health'}
+    # Preview assets require a short-lived, bundle-scoped HMAC in the path. Their
+    # documents have an opaque sandbox origin and cannot use administrator APIs.
+    web_preview=path.startswith('/api/web-preview/')
+    public=web_preview or path in {'/api/auth/status','/api/auth/login','/api/auth/setup','/api/health'}
     local_bootstrap=local and not pw and os.environ.get('ASSET_LOCAL_BOOTSTRAP','1')=='1'
     if path.startswith('/api/') and not public and not (authenticated or local_bootstrap):
         return JSONResponse({'detail':'请先登录' if pw else '请在服务所在主机设置管理员密码'},401)
@@ -91,6 +94,10 @@ async def protection(request,call_next):
         # OCCT's generated Emscripten bindings use new Function inside this worker.
         # Keep that permission out of the document and other script contexts.
         response.headers['Content-Security-Policy']="default-src 'none'; script-src 'self' 'unsafe-eval'; connect-src 'self'"
+    if web_preview:
+        response.headers['Content-Security-Policy']="sandbox allow-scripts allow-downloads; default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self' data:; connect-src 'self'; worker-src 'self' blob:; base-uri 'none'; form-action 'none'; frame-ancestors 'self'"
+        response.headers['Access-Control-Allow-Origin']='*'
+        response.headers['Referrer-Policy']='no-referrer'
     if path.startswith('/api/'):
         response.headers['Cache-Control']='no-store'
     return response
@@ -175,7 +182,7 @@ def stats():
         counts=dict(con.execute('SELECT COUNT(*) AS assets,COALESCE(SUM(size),0) AS bytes,SUM(git_state=\'tracked\') AS tracked FROM assets a WHERE present=1 OR EXISTS(SELECT 1 FROM versions v WHERE v.asset_id=a.id)').fetchone())
         counts['projects']=con.execute('SELECT COUNT(*) FROM projects').fetchone()[0]
         counts['archived']=con.execute('SELECT COUNT(DISTINCT asset_id) FROM versions').fetchone()[0]
-        counts['blob_bytes']=con.execute('SELECT COALESCE(SUM(size),0) FROM (SELECT sha256,MAX(size) AS size FROM versions GROUP BY sha256)').fetchone()[0]
+        counts['blob_bytes']=con.execute('SELECT COALESCE(SUM(size),0) FROM (SELECT sha256,MAX(size) AS size FROM (SELECT sha256,size FROM versions UNION ALL SELECT sha256,size FROM web_objects) GROUP BY sha256)').fetchone()[0]
         counts['kinds']=[dict(r) for r in con.execute('SELECT kind,COUNT(*) AS count,SUM(size) AS bytes FROM assets a WHERE present=1 OR EXISTS(SELECT 1 FROM versions v WHERE v.asset_id=a.id) GROUP BY kind ORDER BY count DESC')]
         counts['pending']=sum(json.loads(r[0]).get('state')!='versioned' for r in con.execute('SELECT git_json FROM projects'))
     return counts
@@ -464,3 +471,6 @@ app.include_router(steward_router)
 
 from .vault_api import router as vault_router
 app.include_router(vault_router)
+
+from .web_api import router as web_router
+app.include_router(web_router)

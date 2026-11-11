@@ -153,6 +153,7 @@ def payload(pid,inventory,progress):
     for i,a in enumerate(assets):
         if not (a['present'] or a['managed'] or a['versions']):continue
         try:
+            git_history.safe_relative(a['relpath'])
             source=project_index.source_for(a,root,overrides);before=source.stat();old=inventory['assets'].get(a['relpath'],{})
             sha=old.get('sha') if old.get('size')==before.st_size and old.get('mtime')==before.st_mtime and old.get('sha') in inventory['objects'] else None
             if not sha:
@@ -177,6 +178,7 @@ def payload(pid,inventory,progress):
         runs=[dict(r) for r in c.execute('SELECT * FROM project_index_runs WHERE project_id=?',(pid,)) if r['id'] not in inventory['runs']]
     histories=[]
     for v in versions:
+        git_history.safe_relative(v['relpath'])
         source=db.blob_root()/v['sha256'][:2]/v['sha256']
         if not source.is_file():continue
         histories.append(v)

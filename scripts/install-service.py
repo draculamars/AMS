@@ -17,6 +17,7 @@ p.add_argument('--host',default='127.0.0.1');p.add_argument('--allowed-hosts',de
 p.add_argument('--write-only',action='store_true')
 a=p.parse_args();root=a.app.expanduser().resolve();vault=a.root.expanduser().resolve()
 if not re.fullmatch('[a-zA-Z0-9_.-]+',a.name) or not 1<=a.port<=65535:raise SystemExit('Invalid service name or port')
+if any(ord(c)<32 for value in [str(root),str(vault)] for c in value):raise SystemExit('Control characters are not supported in deployment paths')
 for folder in ['projects','archive','catalog','backups']:(vault/folder).mkdir(parents=True,exist_ok=True)
 python=root/'.venv/bin/python'
 if not python.is_file():raise SystemExit('Run scripts/install.sh first')
@@ -37,7 +38,9 @@ elif platform.system()=='Linux':
  # systemd quotes differ from shell quotes; reject line breaks and escape specifiers.
  def quote(s):return '"'+str(s).replace('\\','\\\\').replace('"','\\"').replace('%','%%').replace('\n','')+'"'
  path=Path.home()/'.config/systemd/user'/f'{a.name}.service';path.parent.mkdir(parents=True,exist_ok=True)
- body='[Unit]\nDescription=AMS project and asset steward\nAfter=network.target\n[Service]\nType=simple\nWorkingDirectory='+quote(root)+'\n'
+ # WorkingDirectory is a single path, unlike the quoted word lists accepted
+ # by ExecStart and Environment. Outer quotes become literal path characters.
+ body='[Unit]\nDescription=AMS project and asset steward\nAfter=network.target\n[Service]\nType=simple\nWorkingDirectory='+str(root).replace('%','%%')+'\n'
  body+=''.join('Environment='+quote(k+'='+v)+'\n' for k,v in env.items())
  body+='ExecStart='+' '.join(quote(s) for s in args)+'\nRestart=on-failure\nRestartSec=5\nNoNewPrivileges=true\nUMask=0077\n[Install]\nWantedBy=default.target\n'
  path.write_text(body);path.chmod(0o600)

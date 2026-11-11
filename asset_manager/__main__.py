@@ -75,8 +75,15 @@ def main():
             con.backup(dest)
         # Blobs are immutable: use the consistent DB backup to select the exact set.
         with sqlite3.connect(target/'catalog.sqlite3') as con:
-            hashes=[r[0] for r in con.execute('SELECT DISTINCT sha256 FROM versions')]
+            hashes={r[0] for r in con.execute('SELECT DISTINCT sha256 FROM versions')}
+            web_ids=[r[0] for r in con.execute('SELECT id FROM web_bundles')]
             con.execute("DELETE FROM settings WHERE key LIKE 'session:%'")
+        # Adapted publications may reference objects absent from asset versions.
+        # Select their immutable manifests from the same DB snapshot as versions.
+        from . import web_assets
+        for key in web_ids:
+            hashes.update(v['sha256'] for v in web_assets.manifest(str(db.DATA),key)['files'].values())
+        hashes=sorted(hashes)
         manifest=[]
         for sha in hashes:
             src=db.blob_root()/sha[:2]/sha; dst=target/'blobs'/sha[:2]/sha
@@ -98,6 +105,10 @@ def main():
             for file in dst.rglob('*'):
                 if file.is_file():
                     with file.open('rb') as f:support[file.relative_to(target).as_posix()]=hashlib.file_digest(f,'sha256').hexdigest()
+        for key in web_ids:
+            src=db.DATA/'web-bundles'/(key+'.json.gz');dst=target/'web-bundles'/src.name
+            dst.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(src,dst)
+            support[dst.relative_to(target).as_posix()]=hashlib.sha256(dst.read_bytes()).hexdigest()
         (target/'manifest.json').write_text(json.dumps({'created_at':core.now(),'sha256':manifest,'supporting_files':support,'git_history_snapshots':len(archives),'index_snapshots':len(runs)},indent=2))
         print(f'备份完成并校验 {len(hashes)} 个归档对象：{target}')
 
