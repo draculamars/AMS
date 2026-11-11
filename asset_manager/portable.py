@@ -2,7 +2,13 @@
 import json
 import os
 import re
+import threading
 from pathlib import Path
+
+shutdown_requested = threading.Event()
+
+def request_shutdown():
+    shutdown_requested.set()
 
 
 def storage_probe(root, delay=2):
@@ -38,7 +44,7 @@ def request_allowed(method, path):
         return False
     if method in {'GET', 'HEAD', 'OPTIONS'}:
         return True
-    if path in {'/api/auth/login', '/api/auth/logout', '/api/auth/setup', '/api/upload', '/api/archive', '/api/portable/stop'}:
+    if path in {'/api/auth/login', '/api/auth/logout', '/api/auth/setup', '/api/upload', '/api/archive', '/api/portable/stop', '/api/portable/backup'}:
         return method == 'POST'
     allowed = {
         'PATCH': [r'/api/assets/\d+', r'/api/model-projects/[^/]+'],
@@ -46,6 +52,10 @@ def request_allowed(method, path):
                  r'/api/model-projects/[^/]+/(relations|snapshots|upload-plan|upload-apply)',
                  r'/api/assets/\d+/model-preview'],
     }
+    if method == 'POST' and re.fullmatch(r'/api/web-publications/[^/]+/preview', path):
+        return True
+    if method == 'POST' and re.fullmatch(r'/api/portable/backups/[a-f0-9]{32}/verify', path):
+        return True
     return any(re.fullmatch(pattern, path) for pattern in allowed.get(method, []))
 
 
@@ -56,5 +66,5 @@ def status():
     config = json.loads((root / 'portable.json').read_text())
     return {'enabled': True, 'label': 'Atlas 随行资产库', 'root': str(root),
             'dataset': config['active_dataset'], 'captured_at': config.get('captured_at'),
-            'scope': config.get('coverage', {}), 'offline': True,
-            'notice': '当前查看磁盘上的独立资产副本。上传、备注和版本保存在此盘；原项目路径仅表示来源。'}
+            'scope': config.get('coverage', {}), 'offline': True, 'encrypted': False,
+            'notice': '当前查看磁盘上的独立资产副本，资产与恢复点均明文保存。上传、备注和版本保存在此盘；原项目路径仅表示来源。'}

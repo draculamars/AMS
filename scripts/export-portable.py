@@ -15,6 +15,7 @@ import sys
 import tempfile
 import uuid
 from contextlib import closing
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -56,6 +57,22 @@ def checked_copy(source, destination, expected=None):
     fd, tmp = tempfile.mkstemp(dir=destination.parent, prefix='.copy-')
     h = hashlib.sha256()
     try:
+        if sys.platform == 'darwin' and os.environ.get('ATLAS_COPY_MODE') == 'clone':
+            # APFS copy-on-write staging avoids another full physical copy on
+            # a space-constrained Mac. The clone is independent of its source.
+            import ctypes
+            os.close(fd); fd = None; os.unlink(tmp)
+            libc = ctypes.CDLL('libc.dylib', use_errno=True)
+            if libc.clonefile(os.fsencode(source), os.fsencode(tmp), 1) == 0:
+                sha = digest(tmp)
+                after = source.stat()
+                if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+                    raise ValueError('Source changed during clone: ' + str(source))
+                if expected and sha != expected: raise ValueError('Source hash mismatch: ' + str(source))
+                with open(tmp, 'rb') as f: os.fsync(f.fileno())
+                os.replace(tmp, destination)
+                return sha, before.st_size
+            fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         with source.open('rb') as src, os.fdopen(fd, 'wb') as out:
             for chunk in iter(lambda: src.read(4 * 1024**2), b''):
                 h.update(chunk)
@@ -90,6 +107,28 @@ class Objects:
             if expected and expected != sha:
                 raise ValueError('Conflicting historical hash: ' + str(source))
             return sha, size
+        if sys.platform == 'darwin' and os.environ.get('ATLAS_COPY_MODE') == 'clone':
+            import ctypes
+            if source.is_symlink() or not source.is_file(): raise ValueError('Not a regular source file')
+            temporary = self.root/'.incoming'/uuid.uuid4().hex
+            libc = ctypes.CDLL('libc.dylib', use_errno=True)
+            if libc.clonefile(os.fsencode(source), os.fsencode(temporary), 1) == 0:
+                try:
+                    after = source.stat()
+                    if (st.st_size, st.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+                        raise ValueError('Source changed during clone: '+str(source))
+                    # Historical object IDs are checked in the mandatory full
+                    # verification before publishing, rather than re-read here.
+                    sha = expected or digest(temporary)
+                    if not re.fullmatch('[a-f0-9]{64}', sha): raise ValueError('Invalid object digest')
+                    target = self.root/sha[:2]/sha
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(temporary, target)
+                    self.files[sha] = st.st_size
+                    self.seen[ident] = (sha, st.st_size)
+                    return sha, st.st_size
+                finally:
+                    temporary.unlink(missing_ok=True)
         # Hash once before copying to avoid writing duplicate large source files.
         sha = digest(source)
         if expected and expected != sha:
@@ -149,13 +188,13 @@ def git_snapshot(repo, catalog, archive):
                 if proc and proc.poll() is None:
                     proc.terminate()
                     proc.wait()
-    result = subprocess.run(['git', '-C', str(destination), 'fsck', '--full', '--no-reflogs'], capture_output=True, timeout=600)
+    result = subprocess.run(git_history.command(destination, 'fsck', '--full', '--no-reflogs'), capture_output=True, timeout=600)
     if result.returncode:
         raise ValueError('Git fsck failed: ' + result.stderr.decode(errors='replace')[-2000:])
     return destination
 
 
-def export(root, source_catalog, source_archive, resume=False, refresh=True):
+def export(root, source_catalog, source_archive, resume=False, refresh=True, web_imports=(), capture_workers=1):
     root, source_catalog, source_archive = [Path(p).expanduser().resolve() for p in (root, source_catalog, source_archive)]
     if root == Path('/') or root == Path.home() or root.is_relative_to(source_catalog) or root.is_relative_to(source_archive):
         raise ValueError('Choose a new dedicated portable directory')
@@ -204,7 +243,7 @@ def export(root, source_catalog, source_archive, resume=False, refresh=True):
     os.environ['ASSET_DATA_DIR'] = str(catalog)
     os.environ['ASSET_BLOB_DIR'] = str(source_archive)  # Source reads during capture.
     os.environ['ASSET_WATCH_ENABLED'] = '0'
-    from asset_manager import db, core, project_index, git_history, node
+    from asset_manager import db, core, project_index, git_history, node, web_assets
     db.DATA = catalog
     with closing(sqlite3.connect(database)) as c:
         tables={r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -254,14 +293,17 @@ def export(root, source_catalog, source_archive, resume=False, refresh=True):
         current = node.current_paths(p['id'])
         overrides = project_index.source_overrides(p['id'])
         captured = []
-        for i, a in enumerate(rows):
-            if a['relpath'] not in current:
-                continue
-            source = project_index.source_for(a, p['path'], overrides)
-            sha, size = objects.capture(source)
-            captured.append((a['id'], a['relpath'], sha, size))
-            if i % 500 == 0:
-                emit(phase='content', project=p['name'], done=i, total=len(rows), objects=len(objects.files))
+        current_rows=[a for a in rows if a['relpath'] in current]
+        def capture_row(a):
+            source=project_index.source_for(a,p['path'],overrides)
+            sha,size=objects.capture(source)
+            return a['id'],a['relpath'],sha,size
+        # Bound queued tasks and memory. Each capture freezes/checks its own
+        # source; content objects still require full verification at publication.
+        with ThreadPoolExecutor(max_workers=capture_workers) as pool:
+            for offset in range(0,len(current_rows),500):
+                captured.extend(pool.map(capture_row,current_rows[offset:offset+500]))
+                emit(phase='content',project=p['name'],done=len(captured),total=len(current_rows),objects=len(objects.files))
         with db.connect() as c:
             c.execute('DELETE FROM mirror_files WHERE project_id=?', (p['id'],))
             for aid, path, sha, size in captured:
@@ -276,6 +318,30 @@ def export(root, source_catalog, source_archive, resume=False, refresh=True):
         atomic_json(marker, state)
         emit(phase='project-captured', project=p['name'], files=len(captured))
     os.environ['ASSET_BLOB_DIR'] = str(archive)
+    # Preserve immutable web history and adapter-generated objects as well as
+    # normal asset versions. Missing objects never fall back to live host paths.
+    web_assets.init()
+    with db.connect() as c:
+        bundle_ids = [r[0] for r in c.execute('SELECT id FROM web_bundles')]
+    for bid in bundle_ids:
+        manifest = web_assets.manifest(str(source_catalog), bid)
+        checked_copy(source_catalog/'web-bundles'/(bid+'.json.gz'), catalog/'web-bundles'/(bid+'.json.gz'))
+        for info in manifest['files'].values():
+            objects.capture(source_archive/info['sha256'][:2]/info['sha256'], info['sha256'])
+    for descriptor in web_imports:
+        descriptor = Path(descriptor)
+        for item in json.loads(descriptor.with_name('objects.json').read_text(encoding='utf-8')):
+            existing = archive/item['sha256'][:2]/item['sha256']
+            source = existing if existing.is_file() else Path(item['source'])
+            sha, size = objects.capture(source, item['sha256'])
+            if size != item['size']: raise ValueError('Web publication size mismatch')
+        subprocess.run([sys.executable, str(APP/'scripts/web-assets.py'), 'import', '--manifest', str(descriptor)],
+                       env={**os.environ, 'ASSET_DATA_DIR': str(catalog), 'ASSET_BLOB_DIR': str(archive)}, check=True)
+    emit(phase='web-discovery', result=web_assets.discover())
+    with db.connect() as c:
+        web_projects = [r[0] for r in c.execute('SELECT DISTINCT project_id FROM mirror_files')]
+    for pid in web_projects:
+        emit(phase='web-publication', result=web_assets.publish(pid))
     with db.connect() as c:
         repositories = [dict(r) for r in c.execute('SELECT * FROM repositories')]
         old_archives = [dict(r) for r in c.execute('SELECT * FROM repository_archives')]
@@ -325,7 +391,9 @@ def export(root, source_catalog, source_archive, resume=False, refresh=True):
 def verify(root, catalog=None):
     root = Path(root).resolve()
     if catalog is None:
-        cfg = json.loads((root / 'portable.json').read_text())
+        pointer = root/'portable.json'
+        if not pointer.exists(): pointer=root/'portable.pending.json'
+        cfg = json.loads(pointer.read_text(encoding='utf-8'))
         if not re.fullmatch('datasets/[0-9a-f]{32}',cfg.get('active_dataset','')):
             raise ValueError('Invalid dataset path')
         catalog = root / cfg['active_dataset'] / 'catalog'
@@ -339,6 +407,17 @@ def verify(root, catalog=None):
             'development_turns': 'development_turns', 'knowledge_entries': 'knowledge_items'}.items()}
         runs = list(c.execute('SELECT manifest FROM project_index_runs'))
         git_keys = [r[0] for r in c.execute('SELECT DISTINCT fingerprint FROM repository_archives')]
+        tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        bundle_ids = [r[0] for r in c.execute('SELECT id FROM web_bundles')] if 'web_bundles' in tables else []
+        report['web_entries'] = c.execute('SELECT COUNT(*) FROM web_entries').fetchone()[0] if 'web_entries' in tables else 0
+    import gzip
+    for bid in bundle_ids:
+        if not re.fullmatch('[a-f0-9]{64}', bid): raise ValueError('Invalid web bundle')
+        raw = gzip.decompress((Path(catalog)/'web-bundles'/(bid+'.json.gz')).read_bytes())
+        if hashlib.sha256(raw).hexdigest() != bid: raise ValueError('Web manifest checksum mismatch')
+        for item in json.loads(raw)['files'].values():
+            if item['sha256'] in objects and objects[item['sha256']] != item['size']: raise ValueError('Conflicting web size')
+            objects[item['sha256']] = item['size']
     total = 0
     for i, (sha, size) in enumerate(objects.items()):
         if not re.fullmatch('[0-9a-f]{64}', sha):
@@ -359,8 +438,30 @@ def verify(root, catalog=None):
         if not re.fullmatch('[0-9a-f]{64}', key):
             raise ValueError('Invalid Git snapshot')
         folder = Path(catalog) / 'git-history' / 'objects' / key
-        subprocess.run(['git', '-C', str(folder), 'fsck', '--full', '--no-reflogs'], check=True, capture_output=True, timeout=600)
+        from asset_manager import git_history
+        subprocess.run(git_history.command(folder, 'fsck', '--full', '--no-reflogs'), check=True, capture_output=True, timeout=600)
     return {**report, 'objects': len(objects), 'object_bytes': total, 'content_sha256': 'all-passed', 'database': 'integrity_check+foreign_key_check passed', 'checked_at': stamp()}
+
+
+def publish_received(root, platforms):
+    root=Path(root).resolve()
+    if (root/'portable.json').exists() or (root/'session.json').exists(): raise ValueError('Destination is already published or active')
+    config=json.loads((root/'portable.pending.json').read_text(encoding='utf-8'))
+    transfer=json.loads((root/'transfer-state.json').read_text(encoding='utf-8'))
+    if config['id']!=transfer['id']: raise ValueError('Received library identity differs')
+    if digest(root/'app/atlas.zip') != (root/'app/atlas.sha256').read_text().strip(): raise ValueError('Application checksum mismatch')
+    runtimes=json.loads((root/'runtimes/manifest.json').read_text(encoding='utf-8'))
+    if not set(platforms)<=set(runtimes): raise ValueError('Required platform runtime missing')
+    for name,info in runtimes.items():
+        if Path(info['file']).name!=info['file'] or digest(root/'runtimes'/info['file'])!=info['sha256']: raise ValueError('Runtime checksum mismatch: '+name)
+    for name in ['launcher.py','start.sh','start.cmd','Stop Atlas.cmd','Stop Atlas.command']:
+        if not (root/name).is_file(): raise ValueError('Portable launcher missing: '+name)
+    result=verify(root)
+    atomic_json(root/'reports/received-verification.json',result)
+    os.replace(root/'portable.pending.json',root/'portable.json')
+    transfer.update(status='complete',verified_at=stamp(),encrypted=False)
+    atomic_json(root/'transfer-state.json',transfer)
+    return result
 
 
 if __name__ == '__main__':
@@ -371,12 +472,20 @@ if __name__ == '__main__':
     parser.add_argument('--resume', action='store_true')
     parser.add_argument('--no-refresh', action='store_true')
     parser.add_argument('--verify', action='store_true')
+    parser.add_argument('--web-publication', type=Path, action='append', default=[], help='Frozen publication.json with sibling objects.json source map')
+    parser.add_argument('--clone-staging', action='store_true', help='Use independent APFS clones for local staging on macOS')
+    parser.add_argument('--capture-workers',type=int,choices=range(1,9),default=1,help='Bounded concurrent file captures (1–8)')
+    parser.add_argument('--publish-received', action='store_true')
+    parser.add_argument('--require-platform', action='append', default=[])
     args = parser.parse_args()
-    if args.verify:
+    if args.publish_received:
+        emit(phase='received-library-published',**publish_received(args.destination,args.require_platform))
+    elif args.verify:
         result = verify(args.destination)
         atomic_json(args.destination / 'reports' / 'verification.json', result)
         emit(phase='verified', **result)
     else:
         if not args.source_catalog or not args.source_archive:
             parser.error('--source-catalog and --source-archive required')
-        export(args.destination, args.source_catalog, args.source_archive, args.resume, not args.no_refresh)
+        if args.clone_staging: os.environ['ATLAS_COPY_MODE'] = 'clone'
+        export(args.destination, args.source_catalog, args.source_archive, args.resume, not args.no_refresh, args.web_publication,args.capture_workers)

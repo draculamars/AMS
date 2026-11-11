@@ -131,9 +131,24 @@ def portable_stop():
     with db.connect() as con:
         if con.execute("SELECT 1 FROM jobs WHERE status IN ('queued','running') LIMIT 1").fetchone():
             raise HTTPException(409,'请等待当前上传、归档或模型预览任务完成后再停止')
-    import signal
     return JSONResponse({'status':'stopping','message':'正在关闭并保存目录库，请等待启动终端显示完成后再弹出磁盘。'},
-                        background=BackgroundTask(os.kill,os.getpid(),signal.SIGTERM))
+                        background=BackgroundTask(portable.request_shutdown))
+
+@app.get('/api/portable/backups')
+def portable_backups():
+    from . import portable_backup
+    return portable_backup.listing()
+
+@app.post('/api/portable/backup')
+def portable_backup():
+    from . import portable_backup as backup
+    backup.root()
+    return {'job_id':core.run_job('portable_backup',backup.create)}
+
+@app.post('/api/portable/backups/{ident}/verify')
+def portable_backup_verify(ident:str):
+    from . import portable_backup as backup
+    return {'job_id':core.run_job('portable_backup_verify',backup.check,ident)}
 
 @app.get('/api/auth/status')
 def auth_status(request:Request):

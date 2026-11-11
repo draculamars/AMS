@@ -14,7 +14,10 @@ HEX = re.compile(r'^[a-f0-9]{40}([a-f0-9]{24})?$')
 
 
 def command(root, *args):
-    return ['git', '--no-optional-locks', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false',
+    # exFAT has no ownership metadata. Scope trust to this explicit invocation,
+    # never change the user's global config or trust unrelated repositories.
+    trust = ['-c', 'safe.directory=' + Path(root).resolve().as_posix(), '-c', 'core.longpaths=true'] if os.name == 'nt' else []
+    return ['git', *trust, '--no-optional-locks', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false',
             '-c', 'diff.external=', '-c', 'protocol.allow=never', '-C', str(root), *args]
 
 

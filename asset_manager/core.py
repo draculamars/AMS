@@ -48,7 +48,8 @@ def secret(path):
 
 def git(path, *args, timeout=45, check=False):
     env = {**os.environ, 'GIT_TERMINAL_PROMPT':'0', 'GIT_NO_LAZY_FETCH':'1', 'GIT_OPTIONAL_LOCKS':'0', 'GIT_LITERAL_PATHSPECS':'1'}
-    p = subprocess.run(['git','-c','core.hooksPath=/dev/null','-c','core.fsmonitor=false','-c','commit.gpgsign=false','-C',str(path),*args],
+    trust = ['-c', 'safe.directory='+Path(path).resolve().as_posix(), '-c', 'core.longpaths=true'] if os.name == 'nt' else []
+    p = subprocess.run(['git',*trust,'-c','core.hooksPath=/dev/null','-c','core.fsmonitor=false','-c','commit.gpgsign=false','-C',str(path),*args],
                        capture_output=True, env=env, timeout=timeout)
     if check and p.returncode:
         raise ValueError(p.stderr.decode(errors='replace')[:1500] or 'Git 命令失败')

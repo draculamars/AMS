@@ -99,10 +99,11 @@ def receive_git(key):
     work=root/('.incoming-'+uuid.uuid4().hex);work.mkdir()
     try:
         r=subprocess.run(['git','init','--bare','--object-format='+meta.get('object_format','sha1'),str(work)],capture_output=True,check=True)
+        git=git_history.command(work)
         boundaries=meta.get('shallow_boundaries',[])
         if any(not git_history.HEX.fullmatch(x) for x in boundaries+meta['heads']):raise ValueError('Git 对象标识无效')
         if boundaries:(work/'shallow').write_text('\n'.join(boundaries)+'\n')
-        proc=subprocess.Popen(['git','--git-dir='+str(work),'index-pack','--stdin','--fix-thin','--keep=atlas-history'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        proc=subprocess.Popen(git+['index-pack','--stdin','--fix-thin','--keep=atlas-history'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
         try:
             shutil.copyfileobj(sys.stdin.buffer,proc.stdin,1024*1024);proc.stdin.close();proc.stdin=None
             output,error=proc.communicate(timeout=600)
@@ -111,14 +112,14 @@ def receive_git(key):
             if proc.poll() is None:proc.terminate();proc.wait()
         if meta.get('missing_count'):
             for packfile in (work/'objects/pack').glob('*.pack'):packfile.with_suffix('.promisor').write_text('')
-            subprocess.run(['git','--git-dir='+str(work),'config','remote.atlas-incomplete.promisor','true'],check=True)
+            subprocess.run(git+['config','remote.atlas-incomplete.promisor','true'],check=True)
         commands=[]
         for ref in meta['refs']:
             if not git_history.HEX.fullmatch(ref['oid']) or not ref['name'].startswith('refs/') or subprocess.run(['git','check-ref-format',ref['name']],capture_output=True).returncode:raise ValueError('Git 引用名称无效')
             commands.append('update '+ref['name']+' '+ref['oid'])
         commands += ['update refs/atlas/head-'+str(i)+' '+sha for i,sha in enumerate(meta['heads'])]
-        subprocess.run(['git','--git-dir='+str(work),'update-ref','--stdin'],input=('\n'.join(commands)+'\n').encode(),capture_output=True,check=True)
-        check=subprocess.run(['git','--git-dir='+str(work),'fsck','--connectivity-only','--no-reflogs'],capture_output=True,timeout=600)
+        subprocess.run(git+['update-ref','--stdin'],input=('\n'.join(commands)+'\n').encode(),capture_output=True,check=True)
+        check=subprocess.run(git+['fsck','--connectivity-only','--no-reflogs'],capture_output=True,timeout=600)
         if check.returncode:raise ValueError('Git 历史连通性校验失败：'+check.stderr.decode(errors='replace')[-800:])
         (work/'ATLAS-GIT.json').write_text(json.dumps(meta,ensure_ascii=False))
         os.replace(work,dest)

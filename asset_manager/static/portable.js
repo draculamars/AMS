@@ -14,7 +14,9 @@ export async function portableBanner(api,toast){
   try{const result=await api('/api/portable/stop',{method:'POST',body:'{}'});text.textContent=result.message;stop.textContent='正在保存…'}
   catch(error){toast(error.message,true);stop.disabled=false}
  };
- panel.append(text,stop);document.querySelector('.page').prepend(panel);
+ const backup=document.createElement('button');backup.textContent='创建明文恢复点';
+ backup.onclick=async()=>{backup.disabled=true;try{await api('/api/portable/backup',{method:'POST',body:'{}'});toast('已开始创建盘内明文恢复点，进度见任务记录。')}catch(error){toast(error.message,true)}finally{backup.disabled=false}};
+ panel.append(text,backup,stop);document.querySelector('.page').prepend(panel);
  const refresh=document.querySelector('#rescan');if(refresh)refresh.hidden=true;
  for(const view of ['governance','migration']){const button=document.querySelector(`[data-view="${view}"]`);if(button)button.hidden=true;}
  const label=document.querySelector('.status-pill');if(label)label.textContent='磁盘内独立副本';

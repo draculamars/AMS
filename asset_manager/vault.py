@@ -123,13 +123,13 @@ def initialize(pid):
 
 @contextlib.contextmanager
 def lock(pid):
-    import fcntl
+    from . import file_lock
     folder=db.DATA/'vault-locks';folder.mkdir(exist_ok=True)
-    with (folder/(pid+'.lock')).open('a') as f:
-        try:fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    with (folder/(pid+'.lock')).open('a+b') as f:
+        try:file_lock.acquire(f,blocking=False)
         except BlockingIOError:raise ValueError('该备份正在运行，请等待完成')
         try:yield
-        finally:fcntl.flock(f,fcntl.LOCK_UN)
+        finally:file_lock.release(f)
 
 def plan(pid):
     p=profile(pid);b=p['body'];roots=list(b['roots']);missing=[];worktrees=[]

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.1-portable.1 — 2026-11-12
+
+- Windows/macOS 跨平台文件锁、会话隔离和优雅停止；Windows 无管理员离线启动入口。
+- 明文 SSD 资产库与可校验、保留原数据集的盘内恢复点。
+- 保留网页固定发布及专用模型对象；增加 APFS 克隆暂存和 Windows SSH 校验续传。
+
 ## Portable branch (based on 0.6.0)
 
 - Independent removable-disk deployment, offline platform runtimes, content export and full verification tools.

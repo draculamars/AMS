@@ -32,7 +32,10 @@ def package(target):
     (app/'atlas.sha256').write_text(digest+'\n')
     for source in (ROOT/'deploy/portable').iterdir():
         if source.is_file():
-            shutil.copyfile(source,target/source.name)
+            if source.suffix == '.cmd':
+                (target/source.name).write_bytes(source.read_text(encoding='utf-8').replace('\r\n','\n').replace('\n','\r\n').encode('utf-8'))
+            else:
+                shutil.copyfile(source,target/source.name)
             if source.suffix in {'.sh','.command'}:os.chmod(target/source.name,0o755)
     shutil.copyfile(ROOT/'docs/PORTABLE.md',target/'使用说明.md')
     print(json.dumps({'app_sha256':digest,'destination':str(target),'dataset_unchanged':True}))

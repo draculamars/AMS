@@ -4,6 +4,11 @@ const when=s=>s?new Date(s).toLocaleString('zh-CN'):'尚未执行';
 const status={complete:'已保存',running:'进行中',failed:'失败',partial:'部分保存',passed:'通过',pending:'待校验',planned:'待确认',interrupted:'已中断'};
 const kinds={skill:'技能',plugin:'插件',configuration:'配置与工具',instruction:'工程指令',memory:'记忆',rule:'规则',automation:'自动化'};
 export async function mountVault(el,{api,toast,mode}){
+ const portable=await api('/api/portable');
+ if(portable.enabled&&mode!=='knowledge'){
+  const {mountPortableRecovery}=await import('/static/portable-recovery.js');
+  return mountPortableRecovery(el,{api,toast});
+ }
  let dead=false,timer,data,query='',kind='',page=1,selected=null,searchTimer,request=0;
  const post=(url,body={})=>api(url,{method:'POST',body:JSON.stringify(body)});
  const dialog=(html)=>{const m=document.querySelector('#modal');document.querySelector('#modal-content').innerHTML=`<div class="vault-dialog">${html}<div class="vault-actions"><button data-close>关闭</button></div></div>`;m.querySelector('[data-close]').onclick=()=>m.close();if(!m.open)m.showModal();return m};
@@ -39,6 +44,7 @@ export async function mountVault(el,{api,toast,mode}){
   if(focused){const input=el.querySelector('#knowledge-filter');input.focus();input.setSelectionRange(caret,caret)}
   el.querySelector('#knowledge-filter').oninput=e=>{query=e.target.value;page=1;clearTimeout(searchTimer);searchTimer=setTimeout(()=>knowledge().catch(e=>toast(e.message,true)),500)};
   el.querySelector('#knowledge-scan').onclick=()=>job('/api/knowledge-index').catch(e=>toast(e.message,true));
+  if(portable.enabled){el.querySelector('#knowledge-scan').disabled=true;el.querySelector('#knowledge-scan').textContent='来源节点管理';}
   el.querySelector('#knowledge-all').onclick=()=>{kind='';page=1;knowledge()};
   el.querySelectorAll('[data-kind]').forEach(b=>b.onclick=()=>{kind=b.dataset.kind;page=1;knowledge()});
   el.querySelector('#knowledge-prev').onclick=()=>{page--;knowledge()};el.querySelector('#knowledge-next').onclick=()=>{page++;knowledge()};

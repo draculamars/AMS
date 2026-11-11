@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build offline macOS/Ubuntu runtime archives without executing foreign binaries.
+"""Build offline macOS/Windows/Ubuntu archives without executing foreign binaries.
 
 Requires a build host with Python 3.12, uv, curl, zstd and a macOS Git binary for Mac
 targets. Builds only inside the marked export directory. Sources and SHA-256
@@ -16,18 +16,41 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import zipfile
 from pathlib import Path
 
 APP = Path(__file__).resolve().parents[1]
 RELEASE = '20260728'
 PYTHON = '3.12.13'
-BASE = 'https://releases.astral.sh/github/python-build-standalone/releases/download/' + RELEASE
+BASE = 'https://github.com/astral-sh/python-build-standalone/releases/download/' + RELEASE
 TARGETS = {
     'Darwin-arm64': 'aarch64-apple-darwin',
     'Darwin-x86_64': 'x86_64-apple-darwin',
     'Linux-x86_64': 'x86_64-unknown-linux-gnu',
     'Linux-aarch64': 'aarch64-unknown-linux-gnu',
+    'Windows-AMD64': 'x86_64-pc-windows-msvc',
 }
+
+MINGIT_URL = 'https://github.com/git-for-windows/git/releases/download/v2.56.1.windows.1/MinGit-2.56.1-64-bit.zip'
+MINGIT_SHA = '4a92850b6e917da4fd010669b614b55dccf5b0ec333a534cc4be4700dfefdafd'
+WINDOWS_PYTHON = '3.14.10'
+WINDOWS_PYTHON_URL = 'https://www.python.org/ftp/python/3.14.10/python-3.14.10-amd64.zip'
+# Published in https://www.python.org/ftp/python/3.14.10/windows-3.14.10.json
+WINDOWS_PYTHON_SHA = 'cc28026a650970cc1570bb127312f1f9634eb67abfe157ae6ca1acbbc627d091'
+
+def windows_git(stage):
+    archive = stage / 'MinGit-2.56.1-64-bit.zip'
+    download(MINGIT_URL, archive, MINGIT_SHA)
+    files = {}
+    with zipfile.ZipFile(archive) as z:
+        for info in z.infolist():
+            if info.is_dir(): continue
+            name = info.filename
+            if name.startswith('/') or '..' in Path(name).parts or '\\' in name:
+                raise ValueError('Unsafe MinGit member')
+            files['git/' + name] = (z.read(name), 0o644)
+    if 'git/cmd/git.exe' not in files: raise ValueError('MinGit executable missing')
+    return files, [{'url': MINGIT_URL, 'sha256': MINGIT_SHA, 'source': 'https://github.com/git-for-windows/git', 'version': '2.56.1.windows.1'}]
 
 
 def sha(path):
@@ -58,6 +81,7 @@ def add_bytes(out, name, content, mode=0o644):
     info = tarfile.TarInfo(name)
     info.size = len(content)
     info.mode = mode
+    info.mtime = 315532800  # 1980-01-01, representable on exFAT as well as native filesystems.
     out.addfile(info, io.BytesIO(content))
 
 
@@ -84,6 +108,7 @@ def regularized(source, output):
         info = tarfile.TarInfo(name)
         info.size = resolved.size
         info.mode = resolved.mode
+        info.mtime = max(315532800, int(resolved.mtime))
         with source.extractfile(resolved) as data:
             output.addfile(info, data)
 
@@ -152,20 +177,28 @@ def build(root, targets, mac_git):
     checksums = {line.split()[1]: line.split()[0] for line in sums.read_text().splitlines() if len(line.split()) == 2}
     receipts = json.loads((runtime / 'manifest.json').read_text()) if (runtime / 'manifest.json').exists() else {}
     for target in targets:
-        if target in receipts and (runtime / receipts[target]['file']).is_file() and sha(runtime / receipts[target]['file']) == receipts[target]['sha256']:
+        python_version = WINDOWS_PYTHON if target.startswith('Windows') else PYTHON
+        if target in receipts and receipts[target].get('python') == python_version and (runtime / receipts[target]['file']).is_file() and sha(runtime / receipts[target]['file']) == receipts[target]['sha256']:
             print('Already built:', target, flush=True)
             continue
         triple = TARGETS[target]
-        filename = f'cpython-{PYTHON}+{RELEASE}-{triple}-install_only_stripped.tar.gz'
-        python = stage / filename
-        download(BASE + '/' + filename.replace('+', '%2B'), python, checksums[filename])
+        if target.startswith('Windows'):
+            python = stage / WINDOWS_PYTHON_URL.rsplit('/',1)[1]
+            download(WINDOWS_PYTHON_URL, python, WINDOWS_PYTHON_SHA)
+            sources = [{'url':WINDOWS_PYTHON_URL, 'sha256':WINDOWS_PYTHON_SHA,
+                        'publisher_checksums':'https://www.python.org/ftp/python/3.14.10/windows-3.14.10.json',
+                        'distribution':'Python Software Foundation signed Windows binaries; signatures preserved'}]
+        else:
+            filename = f'cpython-{PYTHON}+{RELEASE}-{triple}-install_only_stripped.tar.gz'
+            python = stage / filename
+            download(BASE + '/' + filename.replace('+', '%2B'), python, checksums[filename])
+            sources = [{'url': BASE + '/' + filename, 'sha256': checksums[filename], 'publisher_checksums': BASE + '/SHA256SUMS'}]
         deps = stage / ('deps-' + target)
         if deps.exists():
             shutil.rmtree(deps)
-        subprocess.run(['uv', 'pip', 'install', '--target', str(deps), '--python-version', '3.12', '--python-platform', triple,
+        subprocess.run(['uv', 'pip', 'install', '--target', str(deps), '--python-version', '.'.join(python_version.split('.')[:2]), '--python-platform', triple,
                         '--only-binary', ':all:', '-r', str(APP / 'requirements.lock')],
                        check=True, env={**os.environ, 'UV_CACHE_DIR': str(stage / 'uv-cache'), 'TMPDIR': str(stage)})
-        sources = [{'url': BASE + '/' + filename, 'sha256': checksums[filename], 'publisher_checksums': BASE + '/SHA256SUMS'}]
         if target.startswith('Darwin'):
             if not mac_git or not mac_git.is_file():
                 raise ValueError('Supply --mac-git with a macOS universal Git binary')
@@ -179,22 +212,35 @@ def build(root, targets, mac_git):
             git_files['git/licenses/COPYING'] = (license_path.read_bytes(), 0o644)
             sources.append({'git': subprocess.check_output([str(mac_git), '--version'], text=True).strip(),
                             'source': 'https://github.com/apple-oss-distributions/Git', 'binary_sha256': sha(mac_git), 'requires': 'macOS system libraries'})
+        elif target.startswith('Windows'):
+            git_files, git_sources = windows_git(stage)
+            sources += git_sources
         else:
             git_files, git_sources = ubuntu_git(target.split('-', 1)[1], stage)
             sources += git_sources
         dest = runtime / (target + '.tar.gz')
         with tarfile.open(dest.with_suffix('.tmp'), 'w:gz', compresslevel=5) as out:
-            with tarfile.open(python, 'r:gz') as src:
-                regularized(src, out)
+            if target.startswith('Windows'):
+                with zipfile.ZipFile(python) as src:
+                    for info in src.infolist():
+                        if info.is_dir():continue
+                        name=info.filename
+                        if name.startswith('/') or '..' in Path(name).parts or '\\' in name or ':' in name:
+                            raise ValueError('Unsafe official Python ZIP member')
+                        add_bytes(out,'python/'+name,src.read(name))
+            else:
+                with tarfile.open(python, 'r:gz') as src:
+                    regularized(src, out)
             for path in sorted(deps.rglob('*')):
                 if path.is_file() and not path.is_symlink():
-                    out.add(path, arcname='python/lib/python3.12/site-packages/' + path.relative_to(deps).as_posix(), recursive=False)
+                    prefix = 'python/Lib/site-packages/' if target.startswith('Windows') else 'python/lib/python3.12/site-packages/'
+                    out.add(path, arcname=prefix + path.relative_to(deps).as_posix(), recursive=False)
             for name, (content, mode) in git_files.items():
                 add_bytes(out, name, content, mode)
             add_bytes(out, 'SOURCES.json', json.dumps(sources, ensure_ascii=False, indent=2).encode())
         os.replace(dest.with_suffix('.tmp'), dest)
         receipts[target] = {'file': dest.name, 'sha256': sha(dest), 'bytes': dest.stat().st_size,
-                            'python': PYTHON, 'requirements_sha256': sha(APP / 'requirements.lock'), 'sources': sources}
+                            'python': python_version, 'requirements_sha256': sha(APP / 'requirements.lock'), 'sources': sources}
         (runtime / 'manifest.json').write_text(json.dumps(receipts, ensure_ascii=False, indent=2))
         (runtime / (target + '.sha256')).write_text(receipts[target]['sha256'] + '\n')
         print(json.dumps({'built': target, 'bytes': dest.stat().st_size}), flush=True)

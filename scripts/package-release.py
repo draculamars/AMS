@@ -22,7 +22,15 @@ revision=subprocess.run(['git','-C',str(root),'rev-parse','HEAD'],capture_output
 manifest={'version':__version__,'source_commit':revision.stdout.strip() if revision.returncode==0 else None,'files':{}}
 with zipfile.ZipFile(target,'w',zipfile.ZIP_DEFLATED,compresslevel=6) as z:
     for path,rel in sorted(selected):
-        manifest['files'][rel]=hashlib.sha256(path.read_bytes()).hexdigest();z.write(path,rel)
+        content=path.read_bytes()
+        manifest['files'][rel]=hashlib.sha256(content).hexdigest()
+        info=zipfile.ZipInfo.from_file(path,rel)
+        # Windows/exFAT do not retain POSIX executable bits. Preserve portable
+        # script entry points explicitly so a Windows-built package runs on Mac.
+        executable=path.suffix in {'.sh','.command'} or content.startswith(b'#!')
+        info.create_system=3
+        info.external_attr=(0o100755 if executable else 0o100644)<<16
+        z.writestr(info,content,compress_type=zipfile.ZIP_DEFLATED,compresslevel=6)
     z.writestr('RELEASE-MANIFEST.json',json.dumps(manifest,ensure_ascii=False,indent=2))
 with zipfile.ZipFile(target) as z:
     for rel,sha in manifest['files'].items():assert hashlib.sha256(z.read(rel)).hexdigest()==sha

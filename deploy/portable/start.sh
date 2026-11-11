@@ -33,8 +33,8 @@ if [ ! -f "$DEST/.complete" ]; then
   TEMP="$DEST.staging.$$"
   trap 'rm -rf "$TEMP"; rmdir "$DEST.extracting" 2>/dev/null || true' EXIT HUP INT TERM
   mkdir "$TEMP"
-  tar -xzf "$ARCHIVE" -C "$TEMP"
-  "$TEMP/python/bin/python3.12" -I -c 'import sqlite3, ssl, fastapi, uvicorn, pydantic_core'
+  tar -mxzf "$ARCHIVE" -C "$TEMP"
+  "$TEMP/python/bin/python3.12" -B -I -c 'import sqlite3, ssl, fastapi, uvicorn, pydantic_core'
   touch "$TEMP/.complete"
   mv "$TEMP" "$DEST"
   rmdir "$DEST.extracting"
@@ -47,4 +47,4 @@ if [ "$SYSTEM" = Linux ]; then
 else
   unset DYLD_LIBRARY_PATH DYLD_FALLBACK_LIBRARY_PATH
 fi
-exec "$DEST/python/bin/python3.12" -I "$ROOT/launcher.py" "$ROOT" "${1:-start}" "${2:-}"
+exec "$DEST/python/bin/python3.12" -B -I "$ROOT/launcher.py" "$ROOT" "${1:-start}" "${2:-}"
