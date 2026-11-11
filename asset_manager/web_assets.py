@@ -19,6 +19,7 @@ SCHEMA = '''
 CREATE TABLE IF NOT EXISTS web_bundles(id TEXT PRIMARY KEY,project_id TEXT NOT NULL,created_at TEXT NOT NULL,body TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS web_entries(id TEXT PRIMARY KEY,project_id TEXT NOT NULL,path TEXT NOT NULL,title TEXT NOT NULL,kind TEXT NOT NULL,body TEXT NOT NULL,updated_at TEXT NOT NULL,UNIQUE(project_id,path));
 CREATE TABLE IF NOT EXISTS web_publications(id TEXT PRIMARY KEY,entry_id TEXT NOT NULL,bundle_id TEXT NOT NULL,body TEXT NOT NULL,created_at TEXT NOT NULL,UNIQUE(entry_id,bundle_id));
+CREATE TABLE IF NOT EXISTS web_objects(sha256 TEXT PRIMARY KEY,size INTEGER NOT NULL);
 '''
 
 def init():
@@ -120,6 +121,7 @@ def publish(project_id,files=None,metadata=None):
     with db.connect() as c:
         if not c.execute('SELECT 1 FROM projects WHERE id=?',(project_id,)).fetchone():raise ValueError('工程不存在')
         c.execute('INSERT OR IGNORE INTO web_bundles VALUES(?,?,?,?)',(bid,project_id,now,json.dumps({'files':len(files),'bytes':sum(x['size'] for x in files.values()),'metadata':metadata},ensure_ascii=False)))
+        c.executemany('INSERT OR IGNORE INTO web_objects VALUES(?,?)',((v['sha256'],v['size']) for v in files.values()))
         for entry in c.execute('SELECT * FROM web_entries WHERE project_id=?',(project_id,)).fetchall():
             if entry['path'] not in files:continue
             raw=blob(files[entry['path']]['sha256']).read_text(errors='replace')

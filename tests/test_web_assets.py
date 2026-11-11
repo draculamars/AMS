@@ -58,10 +58,14 @@ def test_analysis_exposes_dependencies_and_never_executes(env,client):
 def test_backup_restores_web_only_objects_and_expired_ticket_fails(env,client,tmp_path,monkeypatch):
     import os,sqlite3,subprocess,sys
     fixture_bundle(env)
+    before=client.get('/api/stats').json()['blob_bytes']
     raw=b'<title>Generated publication</title>'
     sha=hashlib.sha256(raw).hexdigest();path=db.blob_root()/sha[:2]/sha
     path.parent.mkdir(exist_ok=True);path.write_bytes(raw)
     bundle=web_assets.publish('p',{'index.html':{'sha256':sha,'size':len(raw)}})
+    assert client.get('/api/stats').json()['blob_bytes']==before+len(raw)
+    web_assets.publish('p',{'index.html':{'sha256':sha,'size':len(raw)}})
+    assert client.get('/api/stats').json()['blob_bytes']==before+len(raw)
     with db.connect() as c:
         assert not c.execute('SELECT 1 FROM versions WHERE sha256=?',(sha,)).fetchone()
         pub=c.execute('SELECT id FROM web_publications WHERE bundle_id=?',(bundle['bundle_id'],)).fetchone()[0]

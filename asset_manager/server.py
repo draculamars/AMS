@@ -157,7 +157,7 @@ def stats():
         counts=dict(con.execute('SELECT COUNT(*) AS assets,COALESCE(SUM(size),0) AS bytes,SUM(git_state=\'tracked\') AS tracked FROM assets a WHERE present=1 OR EXISTS(SELECT 1 FROM versions v WHERE v.asset_id=a.id)').fetchone())
         counts['projects']=con.execute('SELECT COUNT(*) FROM projects').fetchone()[0]
         counts['archived']=con.execute('SELECT COUNT(DISTINCT asset_id) FROM versions').fetchone()[0]
-        counts['blob_bytes']=con.execute('SELECT COALESCE(SUM(size),0) FROM (SELECT sha256,MAX(size) AS size FROM versions GROUP BY sha256)').fetchone()[0]
+        counts['blob_bytes']=con.execute('SELECT COALESCE(SUM(size),0) FROM (SELECT sha256,MAX(size) AS size FROM (SELECT sha256,size FROM versions UNION ALL SELECT sha256,size FROM web_objects) GROUP BY sha256)').fetchone()[0]
         counts['kinds']=[dict(r) for r in con.execute('SELECT kind,COUNT(*) AS count,SUM(size) AS bytes FROM assets a WHERE present=1 OR EXISTS(SELECT 1 FROM versions v WHERE v.asset_id=a.id) GROUP BY kind ORDER BY count DESC')]
         counts['pending']=sum(json.loads(r[0]).get('state')!='versioned' for r in con.execute('SELECT git_json FROM projects'))
     return counts
