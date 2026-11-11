@@ -131,6 +131,8 @@ def init(recover_jobs=False):
             con.execute("UPDATE jobs SET status='interrupted',detail='服务重启中断了任务，可重新执行' WHERE status IN ('queued','running')")
     from . import vault
     vault.init()
+    from . import web_assets
+    web_assets.init()
     blob_root().mkdir(parents=True, exist_ok=True)
     (DATA / 'tmp').mkdir(exist_ok=True)
     os.chmod(DATA, 0o700)
