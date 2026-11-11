@@ -10,6 +10,22 @@ from test_assets import env,client,HEADERS,run_git,setup_git
 from test_models import put
 
 
+def test_scan_watch_and_sync_share_protected_directory_rules(env):
+    from asset_manager import node
+    put(env,'report.md','report')
+    put(env,'environment/credentials/module.pyi','third-party stub')
+    core.scan_project('p');index.index_one('p')
+    files,dirs=node.filesystem_state({'path':str(env)})
+    assert 'environment/credentials/module.pyi' not in files
+    assert 'environment/credentials' not in dirs
+    with pytest.raises(ValueError):core.safe_path(env,'environment/credentials/module.pyi')
+    data,objects=project_sync.payload('p',{'assets':{},'objects':{},'runs':[]},lambda *a:None)
+    assert {a['relpath'] for a in data['assets']}=={'report.md'}
+    assert json.loads(data['project']['excluded_json'])['credentials']==1
+    for a in data['assets']:history.safe_relative(a['relpath'])
+    assert (env/'environment/credentials/module.pyi').read_text()=='third-party stub'
+
+
 def make_history(root):
     setup_git(root)
     put(root,'README.md','# Test\n[Model](models/part.stl)\n[Notes](docs/notes.md)')
