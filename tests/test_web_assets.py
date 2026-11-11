@@ -54,6 +54,10 @@ def test_analysis_exposes_dependencies_and_never_executes(env,client):
     assert r['body']['issues']==2 and r['body']['external_resources']==1
     assert r['publications']==[]
     assert not list(env.glob('*.executed'))
+    r['body']['runtime']={'independent':True,'note':'Declared by the operator'}
+    with db.connect() as c:c.execute('UPDATE web_entries SET body=? WHERE id=?',(json.dumps(r['body']),r['id']))
+    web_assets.discover();r=web_assets.listing()['items'][0]
+    assert r['kind']=='service' and r['body']['runtime']['independent']
 
 def test_backup_restores_web_only_objects_and_expired_ticket_fails(env,client,tmp_path,monkeypatch):
     import os,sqlite3,subprocess,sys
@@ -86,3 +90,16 @@ def test_browser_evidence_is_explicit_and_scoped(env,client):
     body=web_assets.listing()['items'][0]['publications'][0]['body']
     assert body['verification']=='browser_verified'
     assert 'secret' not in body['browser_evidence']['tested_url']
+
+def test_large_html_is_registered_with_bounded_analysis_and_complete_bytes(env,client):
+    raw=b'<title>Large BOM</title><script></script>'+b' '*(8*1024**2)+b'<p>complete ending</p>'
+    (env/'bom.html').write_bytes(raw);core.scan_project('p')
+    result=web_assets.discover();assert result['registered']==1 and not result['skipped']
+    row=web_assets.listing()['items'][0];assert row['body']['analysis_truncated']
+    with db.connect() as c:aid=c.execute("SELECT id FROM assets WHERE relpath='bom.html'").fetchone()[0]
+    sha=core.archive_asset(aid)['sha256']
+    web_assets.publish('p',{'bom.html':{'sha256':sha,'size':len(raw)}})
+    pub=web_assets.listing()['items'][0]['publications'][0]
+    assert pub['body']['analysis_truncated']
+    response=client.get(web_assets.preview_ticket(pub['id'])['url'])
+    assert response.content==raw

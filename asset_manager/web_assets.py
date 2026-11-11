@@ -46,7 +46,10 @@ class Document(HTMLParser):
         if tag=='script':self.scripts=True
         if tag=='base':self.base=True
         for k in ('src','href','poster','data'):
-            if a.get(k):self.references.append({'value':a[k],'kind':'navigation' if tag=='a' else 'resource'})
+            if a.get(k):
+                value=a[k]
+                if value.startswith('data:'):value=value.split(',',1)[0]+',[embedded]'
+                self.references.append({'value':value,'kind':'navigation' if tag=='a' else 'resource'})
         if a.get('srcset'):
             self.references.extend({'value':x.strip().split()[0],'kind':'resource'} for x in a['srcset'].split(',') if x.strip())
     def handle_endtag(self,tag):
@@ -76,6 +79,15 @@ def analyze(path,raw,available):
             'issues':sum(r['status'] in {'missing','root_path'} and r['kind']=='resource' for r in refs),
             'external_resources':sum(r['status']=='external' and r['kind']=='resource' for r in refs)}
 
+def analyze_file(path,source,available):
+    # Large self-contained portals and BOMs still belong in the catalog. Bound
+    # analysis, not registration or the archived bytes served to the browser.
+    with source.open('rb') as f:raw=f.read(8*1024**2)
+    result=analyze(path,raw.decode('utf-8',errors='replace'),available)
+    result['analysis_truncated']=source.stat().st_size>len(raw)
+    if result['analysis_truncated']:result['coverage']='仅解析前 8 MiB，后续引用未分析；完整原文件已保留，浏览效果需验证'
+    return result
+
 def discover():
     init();out=[];skipped=[]
     with db.connect() as c:
@@ -85,10 +97,8 @@ def discover():
             assets=[dict(x) for x in c.execute("SELECT * FROM assets WHERE project_id=? AND ext IN ('.html','.htm') AND (present=1 OR EXISTS(SELECT 1 FROM mirror_files m WHERE m.project_id=assets.project_id AND m.path=assets.relpath))",(p['id'],))]
             available={x[0] for x in c.execute('SELECT relpath FROM assets WHERE project_id=?',(p['id'],))}
         for a in assets:
-            if a['size']>8*1024**2:
-                skipped.append({'project':p['id'],'path':a['relpath'],'reason':'HTML 超过 8 MiB'});continue
             try:
-                raw=core.source_path(a['id'])[0].read_text(errors='replace');body=analyze(a['relpath'],raw,available)
+                body=analyze_file(a['relpath'],core.source_path(a['id'])[0],available)
                 with db.connect() as c:
                     body['sessions']=[dict(x) for x in c.execute('SELECT DISTINCT s.id,s.title FROM development_artifacts a JOIN development_turns t ON t.id=a.turn_id JOIN development_sessions s ON s.id=t.session_id WHERE a.project_id=? AND a.path=? LIMIT 20',(p['id'],a['relpath']))]
                     body['session_evidence']='indexed_file_event' if body['sessions'] else None
@@ -98,6 +108,10 @@ def discover():
                                 session=c.execute('SELECT id,title FROM development_sessions WHERE id=?',(part,)).fetchone()
                                 if session:body['sessions'].append(dict(session));body['session_evidence']='matching_session_directory'
                     ident=hashlib.sha256((p['id']+'\0'+a['relpath']).encode()).hexdigest()[:24]
+                    previous=c.execute('SELECT body FROM web_entries WHERE id=?',(ident,)).fetchone()
+                    runtime=json.loads(previous[0]).get('runtime') if previous else None
+                    if isinstance(runtime,dict) and runtime.get('independent'):
+                        body['runtime']=runtime;body['kind']='service'
                     c.execute('INSERT INTO web_entries VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,kind=excluded.kind,body=excluded.body,updated_at=excluded.updated_at',(ident,p['id'],a['relpath'],body['title'],body['kind'],json.dumps(body,ensure_ascii=False),core.now()))
                 out.append(ident)
             except (OSError,ValueError) as error:
@@ -124,8 +138,7 @@ def publish(project_id,files=None,metadata=None):
         c.executemany('INSERT OR IGNORE INTO web_objects VALUES(?,?)',((v['sha256'],v['size']) for v in files.values()))
         for entry in c.execute('SELECT * FROM web_entries WHERE project_id=?',(project_id,)).fetchall():
             if entry['path'] not in files:continue
-            raw=blob(files[entry['path']]['sha256']).read_text(errors='replace')
-            b=analyze(entry['path'],raw,files)
+            b=analyze_file(entry['path'],blob(files[entry['path']]['sha256']),files)
             b.update(archived=True,verification='pending',verified_at=None,archive_node=archive_node)
             pub=hashlib.sha256((entry['id']+bid).encode()).hexdigest()[:32]
             c.execute('INSERT OR IGNORE INTO web_publications VALUES(?,?,?,?,?)',(pub,entry['id'],bid,json.dumps(b,ensure_ascii=False),now));published.append(pub)

@@ -64,7 +64,14 @@ def test_real_encrypted_backup_versions_check_and_isolated_restore(recovery,env,
     assert target.read_bytes()==(codex/'auth.json').read_bytes()
     assert 'SECRET-RAW-AUTH' not in json.dumps(vault.export_metadata())
     (env/'README.md').write_text('new version')
+    extra=tmp_path/'new-publication';extra.mkdir();(extra/'index.html').write_text('new publication')
+    with db.connect() as c:
+        row=c.execute('SELECT body FROM vault_profiles WHERE id=?',(pid,)).fetchone();body=json.loads(row[0]);body['roots'].append(str(extra))
+        c.execute('UPDATE vault_profiles SET body=? WHERE id=?',(json.dumps(body),pid))
     second=vault.backup(lambda *a:None,pid);assert second['snapshot']!=result['snapshot']
+    assert vault.snapshot(second['id'])['body']['parent_snapshot']==result['snapshot']
+    r=vault.restore(lambda *a:None,vault.restore_plan(second['id'],[str(extra/'index.html')])['id'])
+    assert (Path(r['target'])/str(extra/'index.html').lstrip('/')).read_text()=='new publication'
     r=vault.restore(lambda *a:None,vault.restore_plan(sid,[str(env/'README.md')])['id'])
     assert (Path(r['target'])/str(env/'README.md').lstrip('/')).read_text()=='uncommitted document'
     assert (env/'README.md').read_text()=='new version'
