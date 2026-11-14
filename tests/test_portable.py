@@ -206,6 +206,10 @@ def test_plain_recovery_point_restores_metadata_without_overwriting_dataset(env,
     monkeypatch.setenv('ATLAS_PORTABLE_ROOT', str(target))
     monkeypatch.setenv('ASSET_BLOB_DIR', str(target/'archive'))
     web_assets.init()
+    # Git pack names make recovery-point paths exceed legacy Windows MAX_PATH.
+    relative=Path('git-history/objects')/('a'*64)/'objects/pack'/('pack-'+('b'*40)+'.pack')
+    metadata=portable_backup.filesystem_path(catalog/relative)
+    metadata.parent.mkdir(parents=True,exist_ok=True);metadata.write_bytes(b'preserve deep Git metadata')
     with db.connect() as c:c.execute("UPDATE assets SET note='before snapshot'")
     backup = portable_backup.create(lambda *args:None)
     assert backup['encrypted'] is False
@@ -222,6 +226,7 @@ def test_plain_recovery_point_restores_metadata_without_overwriting_dataset(env,
     with sqlite3.connect(active) as c:assert c.execute('SELECT note FROM assets').fetchone()[0] == 'before snapshot'
     with db.connect() as c:assert c.execute('SELECT note FROM assets').fetchone()[0] == 'after snapshot'
     assert catalog.is_dir() and restored['previous_dataset_preserved']
+    assert portable_backup.filesystem_path(active.parent/relative).read_bytes()==b'preserve deep Git metadata'
     obj=next((target/'archive').glob('[a-f0-9][a-f0-9]/*'))
     obj.write_bytes(b'bad')
     with pytest.raises(ValueError,match='缺失或损坏'):portable_backup.verify(backup['id'])

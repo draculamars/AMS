@@ -11,6 +11,14 @@ from pathlib import Path, PurePosixPath
 from . import db, core, portable
 
 
+def filesystem_path(path):
+    """Use Windows extended paths for deeply nested Git recovery metadata."""
+    value=os.path.abspath(path)
+    if os.name=='nt' and not value.startswith('\\\\?\\'):
+        value='\\\\?\\UNC\\'+value[2:] if value.startswith('\\\\') else '\\\\?\\'+value
+    return Path(value)
+
+
 def digest(path):
     with path.open('rb') as f: return hashlib.file_digest(f, 'sha256').hexdigest()
 
@@ -18,7 +26,7 @@ def digest(path):
 def root():
     if not portable.enabled(): raise ValueError('当前不是随行资产库')
     db.portable_storage_check()
-    return Path(os.environ['ATLAS_PORTABLE_ROOT']).resolve()
+    return filesystem_path(Path(os.environ['ATLAS_PORTABLE_ROOT']).resolve())
 
 
 def save(path, value):
@@ -40,7 +48,7 @@ def create(progress):
         if dst.execute('PRAGMA integrity_check').fetchone()[0] != 'ok': raise ValueError('恢复点数据库校验失败')
         objects = dict(dst.execute('SELECT sha256,size FROM versions UNION SELECT sha256,size FROM mirror_files UNION SELECT sha256,size FROM web_objects'))
     for name in ['project-index', 'web-bundles', 'git-history']:
-        source = db.DATA/name
+        source = filesystem_path(db.DATA/name)
         if source.exists():
             for p in source.rglob('*'):
                 if p.is_symlink(): raise ValueError('恢复点元数据中存在软链接')
@@ -100,7 +108,12 @@ def _verify(ident, full):
         if not re.fullmatch('[a-f0-9]{64}', sha): raise ValueError('内容对象标识无效')
         p = base/'archive'/sha[:2]/sha
         if p.is_symlink() or not p.is_file() or p.stat().st_size != size or (full and digest(p) != sha): raise ValueError('恢复点内容缺失或损坏：'+sha)
-    with closing(sqlite3.connect((folder/'catalog/catalog.sqlite3').as_uri()+'?mode=ro', uri=True)) as c:
+    database=folder/'catalog/catalog.sqlite3'
+    if not database.is_file():raise ValueError('恢复点目录库缺失')
+    # Extended Windows paths cannot be represented by Path.as_uri correctly.
+    # Open the existing file directly and prohibit SQL writes on this handle.
+    with closing(sqlite3.connect(database)) as c:
+        c.execute('PRAGMA query_only=ON')
         if c.execute('PRAGMA integrity_check').fetchone()[0] != 'ok': raise ValueError('恢复点目录库校验失败')
     result={'id': ident, 'status': 'passed', 'encrypted': False, 'objects': len(manifest['objects']), 'full_content_hashes': full, 'checked_at':core.now()}
     if full:save(folder/'verification.json',result)
