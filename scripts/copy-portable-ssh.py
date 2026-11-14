@@ -55,13 +55,16 @@ def opened_files(items, workers):
 
 def main():
     p=argparse.ArgumentParser();p.add_argument('source',type=Path);p.add_argument('--host',required=True)
-    p.add_argument('--receiver-command',required=True);p.add_argument('--objects-only',action='store_true');p.add_argument('--gzip',action='store_true',help='Compress transport only; SSD files remain plaintext')
+    p.add_argument('--receiver-command',required=True)
+    scope=p.add_mutually_exclusive_group();scope.add_argument('--objects-only',action='store_true');scope.add_argument('--metadata-only',action='store_true',help='Finish an objects-only transfer; publication still checks all destination objects')
+    p.add_argument('--gzip',action='store_true',help='Compress transport only; SSD files remain plaintext')
     p.add_argument('--open-workers',type=int,choices=range(1,9),default=1,help='Prefetch up to 8 source file opens without buffering file contents');a=p.parse_args()
     if not re.fullmatch(r'[A-Za-z0-9_.@:-]+',a.host) or a.host.startswith('-'):raise ValueError('Invalid SSH host')
     root=a.source.resolve();state=json.loads((root/'export-state.json').read_text(encoding='utf-8'))
     if not a.objects_only and (state['status']!='complete' or not (root/'portable.json').is_file()):raise ValueError('Source export is not published')
     files=[]
     for path in sorted((root/'archive' if a.objects_only else root).rglob('*')):
+        if a.metadata_only and path.relative_to(root).parts[0]=='archive':continue
         if not path.is_file():continue
         if path.is_symlink():raise ValueError('Symlink in source export')
         name=path.relative_to(root).as_posix();parts=Path(name).parts
