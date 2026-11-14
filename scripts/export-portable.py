@@ -27,6 +27,14 @@ def stamp():
     return datetime.now(timezone.utc).isoformat()
 
 
+def filesystem_path(path):
+    """Address deep Git refs on Windows without changing machine policy."""
+    value = os.path.abspath(path)
+    if os.name == 'nt' and not value.startswith('\\\\?\\'):
+        value = '\\\\?\\UNC\\' + value[2:] if value.startswith('\\\\') else '\\\\?\\' + value
+    return Path(value)
+
+
 def emit(**fields):
     print(json.dumps({'at': stamp(), **fields}, ensure_ascii=False), flush=True)
 
@@ -503,8 +511,8 @@ def publish_received(root, platforms, verify_workers=1):
         name=item['path'];relative=Path(name)
         if relative.is_absolute() or '..' in relative.parts or '\\' in name or ':' in name:
             raise ValueError('Unsafe transferred metadata path')
-        path=root/relative
-        if not path.resolve().is_relative_to(root) or path.is_symlink() or not path.is_file() or path.stat().st_size!=item['size'] or digest(path)!=item['sha256']:
+        path=filesystem_path(root/relative)
+        if not path.resolve().is_relative_to(filesystem_path(root)) or path.is_symlink() or not path.is_file() or path.stat().st_size!=item['size'] or digest(path)!=item['sha256']:
             raise ValueError('Transferred metadata checksum mismatch: '+name)
     names={x['path'] for x in metadata['files']}
     if not {'portable.pending.json',config['active_dataset']+'/catalog/catalog.sqlite3'}<=names:

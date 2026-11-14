@@ -14,6 +14,13 @@ import sys
 from pathlib import Path, PurePosixPath
 
 
+def filesystem_path(path):
+    value = os.path.abspath(path)
+    if os.name == 'nt' and not value.startswith('\\\\?\\'):
+        value = '\\\\?\\UNC\\' + value[2:] if value.startswith('\\\\') else '\\\\?\\' + value
+    return Path(value)
+
+
 def safe(root, name, resolve=True):
     p = PurePosixPath(name)
     if p.is_absolute() or '..' in p.parts or not p.parts or '\\' in name or ':' in name or name != p.as_posix():
@@ -22,8 +29,8 @@ def safe(root, name, resolve=True):
                          'start.cmd', 'Start Atlas.command', 'Stop Atlas.command', 'Start Atlas.cmd', 'Stop Atlas.cmd',
                          'Verify Atlas.cmd', 'Restore Atlas.cmd', 'Restore Atlas.command', '使用说明.md', 'export-state.json', 'portable.pending.json'}:
         raise ValueError('Transfer path is outside portable content')
-    target = root / name
-    if resolve and (not target.resolve().is_relative_to(root) or target.is_symlink()): raise ValueError('Transfer escapes destination')
+    target = filesystem_path(root / name)
+    if resolve and (not target.resolve().is_relative_to(filesystem_path(root)) or target.is_symlink()): raise ValueError('Transfer escapes destination')
     return target
 
 
@@ -54,14 +61,14 @@ def main():
             tops.add(PurePosixPath(item['path']).parts[0])
         existing=set()
         for name in tops:
-            top=root/name
+            top=filesystem_path(root/name)
             if top.is_symlink() or (hasattr(top,'is_junction') and top.is_junction()):raise ValueError('Transfer namespace is a link')
             if top.is_file():existing.add(name)
             elif top.is_dir():
                 def walk_error(error):raise error
                 for directory,dirs,files in os.walk(top,followlinks=False,onerror=walk_error):
                     dirs[:]=[d for d in dirs if not (Path(directory)/d).is_symlink() and not (hasattr(Path(directory)/d,'is_junction') and (Path(directory)/d).is_junction())]
-                    for filename in files:existing.add((Path(directory)/filename).relative_to(root).as_posix())
+                    for filename in files:existing.add((Path(directory)/filename).relative_to(filesystem_path(root)).as_posix())
         missing=[]
         for item in request['files']:
             if item['path'] not in existing:

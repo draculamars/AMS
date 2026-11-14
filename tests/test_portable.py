@@ -314,6 +314,18 @@ def test_transfer_prefetch_closes_all_handles_when_stream_is_aborted(tmp_path,mo
     assert len(handles)<=5 and all(f.closed for f in handles)
 
 
+def test_transport_preserves_deep_git_metadata_and_inventory(tmp_path):
+    import hashlib
+    root=tmp_path/'deep-metadata';raw=b'git checkpoint reference\n';sha=hashlib.sha256(raw).hexdigest()
+    name='datasets/'+('a'*32)+'/catalog/git-history/objects/'+('b'*64)+'/refs/'+('/'.join(['checkpoint-'+('c'*40)]*4))+'/head'
+    header={'path':name,'sha256':sha,'size':len(raw)}
+    command=[sys.executable,str(ROOT/'scripts/portable-receive.py'),str(root)]
+    received=subprocess.run(command+['receive'],input=(json.dumps({'id':'a'*32})+'\n'+json.dumps(header)+'\n').encode()+raw+b'{"end":true}\n',capture_output=True)
+    assert received.returncode==0,received.stderr
+    found=subprocess.run(command+['inventory'],input=(json.dumps({'id':'a'*32,'files':[header]})+'\n').encode(),capture_output=True)
+    assert found.returncode==0 and json.loads(found.stdout)['missing']==[]
+
+
 def test_resume_web_manifests_and_preserve_missing_retired_git(env,tmp_path):
     make_history(env);project_index.index_one('p')
     git=env/'.git';saved=tmp_path/'saved-git';git.rename(saved)
@@ -373,10 +385,15 @@ def test_received_activation_rejects_corruption_and_missing_platform(env,tmp_pat
     runtime=target/'runtimes';runtime.mkdir()
     archive=runtime/'test.tar.gz';archive.write_bytes(b'fixture runtime bytes')
     (runtime/'manifest.json').write_text(json.dumps({'Windows-AMD64':{'file':archive.name,'sha256':hashlib.sha256(archive.read_bytes()).hexdigest()}}))
+    from asset_manager.portable_backup import filesystem_path
+    deep=filesystem_path(target/cfg['active_dataset']/'catalog/git-history'/('/'.join(['checkpoint-'+('a'*40)]*4))/'ref')
+    deep.parent.mkdir(parents=True);deep.write_bytes(b'checkpoint metadata')
     spec=importlib.util.spec_from_file_location('portable_copy',ROOT/'scripts/copy-portable-ssh.py')
     copier=importlib.util.module_from_spec(spec);spec.loader.exec_module(copier)
-    files=[{'path':p.relative_to(target).as_posix(),'source':str(p),'sha256':copier.sha(p),'size':p.stat().st_size}
-           for p in target.rglob('*') if p.is_file() and not p.relative_to(target).as_posix().startswith('archive/')]
+    native_target=filesystem_path(target)
+    files=[{'path':p.relative_to(native_target).as_posix(),'source':str(p),'sha256':copier.sha(p),'size':p.stat().st_size}
+           for p in native_target.rglob('*') if p.is_file() and not p.relative_to(native_target).as_posix().startswith('archive/')]
+    assert deep.relative_to(native_target).as_posix() in {item['path'] for item in files}
     copier.metadata_manifest(target,cfg['id'],files)
     command=[sys.executable,str(ROOT/'scripts/export-portable.py'),str(target),'--publish-received']
     catalog=target/cfg['active_dataset']/'catalog/catalog.sqlite3';before=catalog.read_bytes()
