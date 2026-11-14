@@ -289,6 +289,29 @@ def test_compressed_transport_stores_plaintext_and_checks_stream(tmp_path):
     assert (target/header['path']).read_bytes()==raw
     bad=subprocess.run(command,input=prefix+payload[:-5],capture_output=True)
     assert bad.returncode!=0 and not (target/'portable.json').exists()
+    request={'id':'c'*32,'files':[header,{**header,'path':'archive/ff/'+('f'*64)}]}
+    inventory=[sys.executable,str(ROOT/'scripts/portable-receive.py'),str(target),'inventory']
+    found=subprocess.run(inventory,input=(json.dumps(request)+'\n').encode(),capture_output=True)
+    assert found.returncode==0 and json.loads(found.stdout)['missing']==[request['files'][1]['path']]
+    (target/header['path']).write_bytes(b'X'*len(raw))
+    changed=subprocess.run(inventory,input=(json.dumps(request)+'\n').encode(),capture_output=True)
+    assert set(json.loads(changed.stdout)['missing'])=={x['path'] for x in request['files']}
+
+
+def test_transfer_prefetch_closes_all_handles_when_stream_is_aborted(tmp_path,monkeypatch):
+    spec=importlib.util.spec_from_file_location('portable_prefetch',ROOT/'scripts/copy-portable-ssh.py')
+    copier=importlib.util.module_from_spec(spec);spec.loader.exec_module(copier)
+    paths=[tmp_path/str(i) for i in range(20)]
+    for path in paths:path.write_bytes(b'content')
+    real_open=Path.open;handles=[]
+    def tracked(path,*args,**kwargs):
+        f=real_open(path,*args,**kwargs);handles.append(f);return f
+    monkeypatch.setattr(Path,'open',tracked)
+    opened=copier.opened_files([{'source':str(p)} for p in paths],4)
+    item,handle=next(opened)
+    assert item['source']==str(paths[0]) and handle.read()==b'content'
+    opened.close()
+    assert len(handles)<=5 and all(f.closed for f in handles)
 
 
 def test_resume_web_manifests_and_preserve_missing_retired_git(env,tmp_path):
@@ -350,7 +373,17 @@ def test_received_activation_rejects_corruption_and_missing_platform(env,tmp_pat
     runtime=target/'runtimes';runtime.mkdir()
     archive=runtime/'test.tar.gz';archive.write_bytes(b'fixture runtime bytes')
     (runtime/'manifest.json').write_text(json.dumps({'Windows-AMD64':{'file':archive.name,'sha256':hashlib.sha256(archive.read_bytes()).hexdigest()}}))
+    spec=importlib.util.spec_from_file_location('portable_copy',ROOT/'scripts/copy-portable-ssh.py')
+    copier=importlib.util.module_from_spec(spec);spec.loader.exec_module(copier)
+    files=[{'path':p.relative_to(target).as_posix(),'source':str(p),'sha256':copier.sha(p),'size':p.stat().st_size}
+           for p in target.rglob('*') if p.is_file() and not p.relative_to(target).as_posix().startswith('archive/')]
+    copier.metadata_manifest(target,cfg['id'],files)
     command=[sys.executable,str(ROOT/'scripts/export-portable.py'),str(target),'--publish-received']
+    catalog=target/cfg['active_dataset']/'catalog/catalog.sqlite3';before=catalog.read_bytes()
+    with sqlite3.connect(catalog) as c:c.execute("UPDATE assets SET name='changed but valid database'")
+    changed=subprocess.run(command,capture_output=True)
+    assert changed.returncode!=0 and b'metadata checksum mismatch' in changed.stderr and not (target/'portable.json').exists()
+    catalog.write_bytes(before)
     missing=subprocess.run(command+['--require-platform','Darwin-arm64'],capture_output=True)
     assert missing.returncode!=0 and not (target/'portable.json').exists()
     blob=next((target/'archive').glob('[a-f0-9][a-f0-9]/*'));original=blob.read_bytes();blob.write_bytes(b'damaged')

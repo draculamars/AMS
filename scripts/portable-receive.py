@@ -14,7 +14,7 @@ import sys
 from pathlib import Path, PurePosixPath
 
 
-def safe(root, name):
+def safe(root, name, resolve=True):
     p = PurePosixPath(name)
     if p.is_absolute() or '..' in p.parts or not p.parts or '\\' in name or ':' in name or name != p.as_posix():
         raise ValueError('Invalid transfer path')
@@ -23,7 +23,7 @@ def safe(root, name):
                          'Verify Atlas.cmd', 'Restore Atlas.cmd', 'Restore Atlas.command', '使用说明.md', 'export-state.json', 'portable.pending.json'}:
         raise ValueError('Transfer path is outside portable content')
     target = root / name
-    if not target.resolve().is_relative_to(root) or target.is_symlink(): raise ValueError('Transfer escapes destination')
+    if resolve and (not target.resolve().is_relative_to(root) or target.is_symlink()): raise ValueError('Transfer escapes destination')
     return target
 
 
@@ -46,8 +46,26 @@ def main():
         if any(x.name!='build' for x in root.iterdir()):raise ValueError('Destination is not empty or marked')
         marker.write_text(json.dumps({'id':ident,'status':'receiving','encrypted':False}),encoding='utf-8')
     if a.action=='inventory':
+        # Enumerate only requested namespaces once. Resolving every absent path
+        # separately on Windows is expensive, especially on a new USB volume.
+        tops=set()
+        for item in request['files']:
+            safe(root,item['path'],resolve=False)
+            tops.add(PurePosixPath(item['path']).parts[0])
+        existing=set()
+        for name in tops:
+            top=root/name
+            if top.is_symlink() or (hasattr(top,'is_junction') and top.is_junction()):raise ValueError('Transfer namespace is a link')
+            if top.is_file():existing.add(name)
+            elif top.is_dir():
+                def walk_error(error):raise error
+                for directory,dirs,files in os.walk(top,followlinks=False,onerror=walk_error):
+                    dirs[:]=[d for d in dirs if not (Path(directory)/d).is_symlink() and not (hasattr(Path(directory)/d,'is_junction') and (Path(directory)/d).is_junction())]
+                    for filename in files:existing.add((Path(directory)/filename).relative_to(root).as_posix())
         missing=[]
         for item in request['files']:
+            if item['path'] not in existing:
+                missing.append(item['path']);continue
             path=safe(root,item['path'])
             if not path.is_file() or path.stat().st_size!=item['size'] or digest(path)!=item['sha256']:missing.append(item['path'])
         print(json.dumps({'missing':missing}));return

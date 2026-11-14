@@ -497,6 +497,21 @@ def publish_received(root, platforms, verify_workers=1):
     config=json.loads((root/'portable.pending.json').read_text(encoding='utf-8'))
     transfer=json.loads((root/'transfer-state.json').read_text(encoding='utf-8'))
     if config['id']!=transfer['id']: raise ValueError('Received library identity differs')
+    metadata=json.loads((root/'reports/transfer-metadata.json').read_text(encoding='utf-8'))
+    if metadata.get('format')!=1 or metadata.get('id')!=config['id']:raise ValueError('Transfer metadata identity differs')
+    def check_metadata(item):
+        name=item['path'];relative=Path(name)
+        if relative.is_absolute() or '..' in relative.parts or '\\' in name or ':' in name:
+            raise ValueError('Unsafe transferred metadata path')
+        path=root/relative
+        if not path.resolve().is_relative_to(root) or path.is_symlink() or not path.is_file() or path.stat().st_size!=item['size'] or digest(path)!=item['sha256']:
+            raise ValueError('Transferred metadata checksum mismatch: '+name)
+    names={x['path'] for x in metadata['files']}
+    if not {'portable.pending.json',config['active_dataset']+'/catalog/catalog.sqlite3'}<=names:
+        raise ValueError('Transfer metadata does not cover the catalog and activation pointer')
+    with ThreadPoolExecutor(max_workers=verify_workers) as pool:
+        for start in range(0,len(metadata['files']),500):
+            list(pool.map(check_metadata,metadata['files'][start:start+500]))
     if digest(root/'app/atlas.zip') != (root/'app/atlas.sha256').read_text().strip(): raise ValueError('Application checksum mismatch')
     runtimes=json.loads((root/'runtimes/manifest.json').read_text(encoding='utf-8'))
     if not set(platforms)<=set(runtimes): raise ValueError('Required platform runtime missing')
@@ -505,6 +520,8 @@ def publish_received(root, platforms, verify_workers=1):
     for name in ['launcher.py','start.sh','start.cmd','Stop Atlas.cmd','Stop Atlas.command']:
         if not (root/name).is_file(): raise ValueError('Portable launcher missing: '+name)
     result=verify(root, workers=verify_workers)
+    result['transferred_metadata_files']=len(metadata['files'])
+    result['metadata_sha256']='all-passed'
     atomic_json(root/'reports/received-verification.json',result)
     os.replace(root/'portable.pending.json',root/'portable.json')
     transfer.update(status='complete',verified_at=stamp(),encrypted=False)

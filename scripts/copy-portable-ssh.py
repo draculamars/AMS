@@ -11,6 +11,9 @@ import json
 import re
 import subprocess
 import tempfile
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 
 
@@ -18,9 +21,42 @@ def sha(path):
     with path.open('rb') as f:return hashlib.file_digest(f,'sha256').hexdigest()
 
 
+def metadata_manifest(root, ident, files):
+    """Bind copied metadata bytes to the source, beyond SQLite/Git structure checks."""
+    target=root/'reports/transfer-metadata.json'
+    payload={'format':1,'id':ident,'files':[{k:v for k,v in x.items() if k!='source'} for x in files
+             if not x['path'].startswith('archive/') and x['path']!='reports/transfer-metadata.json']}
+    target.write_text(json.dumps(payload,ensure_ascii=False),encoding='utf-8')
+    return {'path':'reports/transfer-metadata.json','source':str(target),'sha256':sha(target),'size':target.stat().st_size}
+
+
+def opened_files(items, workers):
+    """Overlap slow filesystem opens, with a bounded number of live handles."""
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        pending=deque();remaining=iter(items)
+        def enqueue():
+            item=next(remaining,None)
+            if item is not None:pending.append((item,pool.submit(Path(item['source']).open,'rb')))
+        for _ in range(workers):enqueue()
+        try:
+            while pending:
+                item,future=pending.popleft();handle=future.result()
+                try:
+                    enqueue()
+                    yield item,handle
+                finally:handle.close()
+        finally:
+            for _,future in pending:
+                if not future.cancel():
+                    try:handle=future.result()
+                    except Exception:continue
+                    handle.close()
+
+
 def main():
     p=argparse.ArgumentParser();p.add_argument('source',type=Path);p.add_argument('--host',required=True)
-    p.add_argument('--receiver-command',required=True);p.add_argument('--objects-only',action='store_true');p.add_argument('--gzip',action='store_true',help='Compress transport only; SSD files remain plaintext');a=p.parse_args()
+    p.add_argument('--receiver-command',required=True);p.add_argument('--objects-only',action='store_true');p.add_argument('--gzip',action='store_true',help='Compress transport only; SSD files remain plaintext')
+    p.add_argument('--open-workers',type=int,choices=range(1,9),default=1,help='Prefetch up to 8 source file opens without buffering file contents');a=p.parse_args()
     if not re.fullmatch(r'[A-Za-z0-9_.@:-]+',a.host) or a.host.startswith('-'):raise ValueError('Invalid SSH host')
     root=a.source.resolve();state=json.loads((root/'export-state.json').read_text(encoding='utf-8'))
     if not a.objects_only and (state['status']!='complete' or not (root/'portable.json').is_file()):raise ValueError('Source export is not published')
@@ -31,8 +67,10 @@ def main():
         name=path.relative_to(root).as_posix();parts=Path(name).parts
         if parts[0] in {'build','backups'} or '.incoming' in parts or 'expanded' in parts or path.name.startswith('.'):continue
         if name=='portable.json':name='portable.pending.json'
+        if name=='reports/transfer-metadata.json':continue
         digest=path.name if parts[0]=='archive' and re.fullmatch('[a-f0-9]{64}',path.name) else sha(path)
         files.append({'path':name,'source':str(path),'sha256':digest,'size':path.stat().st_size})
+    if not a.objects_only:files.append(metadata_manifest(root,state['id'],files))
     ssh=['ssh','-oBatchMode=yes','-oStrictHostKeyChecking=yes','-oConnectTimeout=15','-oServerAliveInterval=15','-oServerAliveCountMax=4',a.host]
     request={'id':state['id'],'files':[{k:v for k,v in x.items() if k!='source'} for x in files]}
     print(json.dumps({'phase':'inventory','files':len(files),'bytes':sum(x['size'] for x in files)}),flush=True)
@@ -46,12 +84,12 @@ def main():
             proc.stdin.write((json.dumps({'id':state['id']})+'\n').encode());done=0
             proc.stdin.flush()
             stream=gzip.GzipFile(fileobj=proc.stdin,mode='wb',compresslevel=1) if a.gzip else proc.stdin
-            for i,item in enumerate(selected):
-                stream.write((json.dumps({k:v for k,v in item.items() if k!='source'})+'\n').encode())
-                with Path(item['source']).open('rb') as f:
+            with closing(opened_files(selected,a.open_workers)) as opened:
+                for i,(item,f) in enumerate(opened):
+                    stream.write((json.dumps({k:v for k,v in item.items() if k!='source'})+'\n').encode())
                     for chunk in iter(lambda:f.read(4*1024**2),b''):stream.write(chunk)
-                done+=item['size']
-                if i%1000==0:print(json.dumps({'done':i+1,'total':len(selected),'bytes':done}),flush=True)
+                    done+=item['size']
+                    if i%1000==0:print(json.dumps({'done':i+1,'total':len(selected),'bytes':done}),flush=True)
             stream.write(b'{"end":true}\n')
             if a.gzip:stream.close()
             proc.stdin.close();proc.stdin=None
