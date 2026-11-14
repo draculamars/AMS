@@ -64,7 +64,11 @@ def status():
         return {'enabled': False}
     root = Path(os.environ['ATLAS_PORTABLE_ROOT'])
     config = json.loads((root / 'portable.json').read_text())
+    missing=config.get('coverage',{}).get('git_metadata_only_retired',0)
+    notice='当前查看磁盘上的独立资产副本，资产与恢复点均明文保存。上传、备注和版本保存在此盘；原项目路径仅表示来源。'
+    if missing:notice+=f' {missing} 个已移除的旧依赖仓库仅保留索引，Git 对象缺口见 reports/git-coverage.json。'
     return {'enabled': True, 'label': 'Atlas 随行资产库', 'root': str(root),
             'dataset': config['active_dataset'], 'captured_at': config.get('captured_at'),
+            'started_at': config.get('started_at'),
             'scope': config.get('coverage', {}), 'offline': True, 'encrypted': False,
-            'notice': '当前查看磁盘上的独立资产副本，资产与恢复点均明文保存。上传、备注和版本保存在此盘；原项目路径仅表示来源。'}
+            'notice': notice}

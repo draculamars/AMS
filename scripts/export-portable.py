@@ -145,7 +145,28 @@ class Objects:
         return sha, st.st_size
 
 
-def git_snapshot(repo, catalog, archive):
+def git_source(repo, repositories):
+    """Find existing local objects without changing source provenance or fetching."""
+    from asset_manager import git_history
+    meta=json.loads(repo['body'])
+    tips=sorted({r['oid'] for r in meta['refs']} | set(meta['heads']))
+    for candidate in [repo,*repositories]:
+        other=json.loads(candidate['body'])
+        path=candidate['source_root']
+        if not Path(path).is_dir():continue
+        same_snapshot=other['fingerprint']==meta['fingerprint']
+        if not same_snapshot and (not meta.get('remote') or other.get('remote')!=meta['remote']):continue
+        if meta.get('missing_count') and not same_snapshot:continue
+        result=subprocess.run(git_history.command(path,'cat-file','--batch-check=%(objectname) %(objecttype)'),
+                              input=('\n'.join(tips)+'\n').encode(),capture_output=True,
+                              env=git_history.environment(),timeout=60)
+        lines=result.stdout.decode().splitlines()
+        if not result.returncode and len(lines)==len(tips) and all(len(line.split())==2 and line.split()[0]==oid and not line.endswith(' missing') for oid,line in zip(tips,lines)):
+            return path
+    return None
+
+
+def git_snapshot(repo, catalog, archive, repositories=()):
     from asset_manager import git_history
     meta = json.loads(repo['body'])
     tips = sorted({r['oid'] for r in meta['refs']} | set(meta['heads']))
@@ -154,10 +175,12 @@ def git_snapshot(repo, catalog, archive):
     key = meta['fingerprint']
     destination = catalog / 'git-history' / 'objects' / key
     if not (destination / 'ATLAS-GIT.json').is_file():
+        source=git_source(repo,repositories)
+        if not source:raise FileNotFoundError('Git source and matching local objects unavailable: '+repo['source_root'])
         args = ['--revs']
         inputs = tips
         if meta.get('missing_count'):
-            lines = git_history.run(repo['source_root'], 'rev-list', '--objects', '--all', *meta['heads'], '--missing=print', '--no-object-names').decode().splitlines()
+            lines = git_history.run(source, 'rev-list', '--objects', '--all', *meta['heads'], '--missing=print', '--no-object-names').decode().splitlines()
             if sorted(x[1:] for x in lines if x.startswith('?')) != meta['missing_objects']:
                 raise ValueError('Partial-clone object state changed')
             inputs = [x for x in lines if not x.startswith('?')]
@@ -170,7 +193,7 @@ def git_snapshot(repo, catalog, archive):
             receiver.stdin.write(json.dumps(meta).encode() + b'\n')
             receiver.stdin.flush()
             with tempfile.TemporaryFile() as errors:
-                pack = subprocess.Popen(git_history.command(repo['source_root'], '-c', 'pack.threads=2', 'pack-objects', '--stdout', *args, '--delta-base-offset'),
+                pack = subprocess.Popen(git_history.command(source, '-c', 'pack.threads=2', 'pack-objects', '--stdout', *args, '--delta-base-offset'),
                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors, env=git_history.environment())
                 pack.stdin.write(('\n'.join(inputs) + '\n').encode())
                 pack.stdin.close()
@@ -324,10 +347,13 @@ def export(root, source_catalog, source_archive, resume=False, refresh=True, web
     with db.connect() as c:
         bundle_ids = [r[0] for r in c.execute('SELECT id FROM web_bundles')]
     for bid in bundle_ids:
-        manifest = web_assets.manifest(str(source_catalog), bid)
-        checked_copy(source_catalog/'web-bundles'/(bid+'.json.gz'), catalog/'web-bundles'/(bid+'.json.gz'))
+        if not (catalog/'web-bundles'/(bid+'.json.gz')).is_file():
+            checked_copy(source_catalog/'web-bundles'/(bid+'.json.gz'), catalog/'web-bundles'/(bid+'.json.gz'))
+        manifest = web_assets.manifest(str(catalog), bid)
         for info in manifest['files'].values():
-            objects.capture(source_archive/info['sha256'][:2]/info['sha256'], info['sha256'])
+            source=archive/info['sha256'][:2]/info['sha256']
+            if not source.is_file():source=source_archive/info['sha256'][:2]/info['sha256']
+            objects.capture(source, info['sha256'])
     for descriptor in web_imports:
         descriptor = Path(descriptor)
         for item in json.loads(descriptor.with_name('objects.json').read_text(encoding='utf-8')):
@@ -343,7 +369,7 @@ def export(root, source_catalog, source_archive, resume=False, refresh=True, web
     for pid in web_projects:
         emit(phase='web-publication', result=web_assets.publish(pid))
     with db.connect() as c:
-        repositories = [dict(r) for r in c.execute('SELECT * FROM repositories')]
+        repositories = [dict(r) for r in c.execute('SELECT r.*, (SELECT COUNT(*) FROM project_repositories p WHERE p.repository_id=r.id) active_links FROM repositories r')]
         old_archives = [dict(r) for r in c.execute('SELECT * FROM repository_archives')]
     for r in old_archives:
         key = r['fingerprint']
@@ -359,10 +385,20 @@ def export(root, source_catalog, source_archive, resume=False, refresh=True, web
             raise ValueError('Missing prior Git archive: ' + key)
         with db.connect() as c:
             c.execute('UPDATE repository_archives SET archive_path=? WHERE repository_id=? AND fingerprint=?', (str(dst), r['repository_id'], key))
+    unavailable=[]
     for i, r in enumerate(repositories):
         emit(phase='git', done=i, total=len(repositories))
         meta = json.loads(r['body'])
-        path = git_snapshot(r, catalog, archive)
+        try:
+            path = git_snapshot(r, catalog, archive,repositories)
+        except FileNotFoundError:
+            if r['active_links']:raise
+            # Retain historical metadata for retired dependencies. Never invent
+            # an archive or silently describe these lost objects as backed up.
+            unavailable.append({'repository_id':r['id'],'source_root':r['source_root'],
+                                'commits':meta['commits'],'status':'metadata_only_source_removed'})
+            emit(phase='retired-git-unavailable',repository_id=r['id'])
+            continue
         if path:
             with db.connect() as c:
                 c.execute('UPDATE repositories SET archive_path=?,archive_at=? WHERE id=?', (str(path), stamp(), r['id']))
@@ -376,9 +412,10 @@ def export(root, source_catalog, source_archive, resume=False, refresh=True, web
         c.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchall()
         c.execute('PRAGMA journal_mode=DELETE').fetchall()
     c.close()
+    atomic_json(root/'reports/git-coverage.json',{'unavailable_retired_repositories':unavailable})
     report = verify(root, catalog)
     config = {'format': 1, 'id': state['id'], 'active_dataset': catalog.parent.relative_to(root).as_posix(),
-              'captured_at': stamp(), 'started_at': state['started_at'], 'coverage': report,
+              'captured_at': stamp(), 'started_at': state['started_at'], 'coverage': report, 'encrypted':False,
               'note': 'File-stable capture interval; not a filesystem-wide atomic snapshot. Existing parser coverage and missing dependencies are preserved. Remote-only data is not included.'}
     atomic_json(root / 'reports' / 'export.json', config)
     atomic_json(root / 'portable.json', config)  # Publish only after full content verification.
@@ -410,6 +447,9 @@ def verify(root, catalog=None):
         tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         bundle_ids = [r[0] for r in c.execute('SELECT id FROM web_bundles')] if 'web_bundles' in tables else []
         report['web_entries'] = c.execute('SELECT COUNT(*) FROM web_entries').fetchone()[0] if 'web_entries' in tables else 0
+    coverage=root/'reports/git-coverage.json'
+    if coverage.is_file():
+        report['git_metadata_only_retired']=len(json.loads(coverage.read_text(encoding='utf-8'))['unavailable_retired_repositories'])
     import gzip
     for bid in bundle_ids:
         if not re.fullmatch('[a-f0-9]{64}', bid): raise ValueError('Invalid web bundle')

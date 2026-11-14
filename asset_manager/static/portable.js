@@ -7,7 +7,8 @@ export async function portableBanner(api,toast){
  const panel=document.createElement('div');panel.className='notice';panel.id='portable-banner';
  const text=document.createElement('span');
  const date=state.captured_at?new Date(state.captured_at).toLocaleString('zh-CN'):'';
- text.textContent=`随行资产库 · ${date} 导出。${state.notice}`;
+ const started=state.started_at?new Date(state.started_at).toLocaleString('zh-CN'):'';
+ text.textContent=`随行资产库 · ${started?`采集区间 ${started} 至 ${date}`:`${date} 导出`}。${state.notice}`;
  const stop=document.createElement('button');stop.textContent='安全停止';
  stop.onclick=async()=>{
   stop.disabled=true;

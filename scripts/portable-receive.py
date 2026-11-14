@@ -5,6 +5,7 @@ The stream is JSON headers followed by exact file bytes. Only an unfinished,
 identified transfer is writable; portable.json is activated separately after QA.
 """
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -31,7 +32,7 @@ def digest(p):
 
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('root',type=Path);p.add_argument('action',choices=['inventory','receive']);a=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('root',type=Path);p.add_argument('action',choices=['inventory','receive']);p.add_argument('--gzip',action='store_true');a=p.parse_args()
     root=a.root.resolve();root.mkdir(parents=True,exist_ok=True)
     if (root/'portable.json').exists() or (root/'session.json').exists():raise ValueError('Published or active library cannot be overwritten')
     inp=sys.stdin.buffer
@@ -50,6 +51,7 @@ def main():
             path=safe(root,item['path'])
             if not path.is_file() or path.stat().st_size!=item['size'] or digest(path)!=item['sha256']:missing.append(item['path'])
         print(json.dumps({'missing':missing}));return
+    if a.gzip:inp=gzip.GzipFile(fileobj=inp,mode='rb')
     count=0;total=0
     while True:
         line=inp.readline(1024**2)
@@ -75,6 +77,7 @@ def main():
             if h.hexdigest()!=sha:raise ValueError('Transfer hash mismatch: '+item['path'])
             os.replace(temp,target);count+=1;total+=size
         finally:temp.unlink(missing_ok=True)
+    if a.gzip and inp.read(1):raise ValueError('Trailing transfer data')
     print(json.dumps({'status':'received','files':count,'bytes':total,'encrypted':False,'activation':'pending full verification and volume flush'}),flush=True)
 
 

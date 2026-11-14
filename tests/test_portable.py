@@ -271,6 +271,50 @@ def test_transport_rejects_bad_hash_and_published_overwrite(tmp_path):
     assert blocked.returncode!=0 and (target/header['path']).read_bytes()==raw
 
 
+def test_compressed_transport_stores_plaintext_and_checks_stream(tmp_path):
+    import gzip,hashlib
+    raw=b'plaintext model data\n'*1000;sha=hashlib.sha256(raw).hexdigest()
+    header={'path':'archive/'+sha[:2]+'/'+sha,'sha256':sha,'size':len(raw)}
+    prefix=(json.dumps({'id':'c'*32})+'\n').encode()
+    payload=gzip.compress((json.dumps(header)+'\n').encode()+raw+b'{"end":true}\n')
+    target=tmp_path/'compressed'
+    command=[sys.executable,str(ROOT/'scripts/portable-receive.py'),str(target),'receive','--gzip']
+    good=subprocess.run(command,input=prefix+payload,capture_output=True)
+    assert good.returncode==0,good.stderr
+    assert (target/header['path']).read_bytes()==raw
+    bad=subprocess.run(command,input=prefix+payload[:-5],capture_output=True)
+    assert bad.returncode!=0 and not (target/'portable.json').exists()
+
+
+def test_resume_web_manifests_and_preserve_missing_retired_git(env,tmp_path):
+    make_history(env);project_index.index_one('p')
+    git=env/'.git';saved=tmp_path/'saved-git';git.rename(saved)
+    target=tmp_path/'resume'
+    failed=run_export(target,db.DATA,db.blob_root(),'--no-refresh')
+    assert failed.returncode!=0 and not (target/'portable.json').exists()
+    saved.rename(git)
+    resumed=run_export(target,db.DATA,db.blob_root(),'--resume')
+    assert resumed.returncode==0,resumed.stderr
+    git.rename(saved)
+    retired=tmp_path/'retired'
+    result=run_export(retired,db.DATA,db.blob_root())
+    assert result.returncode==0,result.stderr
+    config=json.loads((retired/'portable.json').read_text())
+    assert config['coverage']['git_metadata_only_retired']==1
+    assert config['coverage']['git_snapshots']==0
+    report=json.loads((retired/'reports/git-coverage.json').read_text())
+    assert report['unavailable_retired_repositories'][0]['status']=='metadata_only_source_removed'
+
+
+def test_missing_git_source_reuses_matching_local_objects(env,tmp_path):
+    make_history(env);project_index.index_one('p')
+    with db.connect() as c:repo=dict(c.execute('SELECT * FROM repositories').fetchone())
+    missing={**repo,'source_root':str(tmp_path/'removed')}
+    spec=importlib.util.spec_from_file_location('portable_export_git_source',ROOT/'scripts/export-portable.py')
+    exporter=importlib.util.module_from_spec(spec);spec.loader.exec_module(exporter)
+    assert exporter.git_source(missing,[repo])==repo['source_root']
+
+
 @pytest.mark.skipif(sys.platform!='darwin',reason='APFS clone capture is macOS-specific')
 def test_clone_capture_is_independent_of_source_changes(tmp_path,monkeypatch):
     import hashlib
