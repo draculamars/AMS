@@ -38,7 +38,7 @@ def test_export_current_history_git_and_relocation_without_host_reads(env, tmp_p
     sibling = tmp_path / 'existing.txt'
     sibling.write_text('keep me')
     target = tmp_path / 'portable'
-    result = run_export(target, source, blobs, '--capture-workers', '4')
+    result = run_export(target, source, blobs, '--capture-workers', '4', '--verify-workers', '4')
     assert result.returncode == 0, result.stderr
     assert (source / 'catalog.sqlite3').read_bytes() == original
     assert sibling.read_text() == 'keep me'
@@ -60,11 +60,11 @@ def test_export_current_history_git_and_relocation_without_host_reads(env, tmp_p
     assert git_history.repository(rid)['source'] == 'archive'
     assert {x['oid'] for x in git_history.commits(rid)['items']} == {first, second}
     assert 'First design' in git_history.blob_bytes(rid, first, 'docs/notes.md')[0].decode()
-    check = subprocess.run([sys.executable, str(ROOT / 'scripts/export-portable.py'), str(moved), '--verify'], capture_output=True, text=True)
+    check = subprocess.run([sys.executable, str(ROOT / 'scripts/export-portable.py'), str(moved), '--verify', '--verify-workers', '4'], capture_output=True, text=True)
     assert check.returncode == 0, check.stderr
     blob = core.source_path(aid)[0]
     blob.write_text('corrupt')
-    check = subprocess.run([sys.executable, str(ROOT / 'scripts/export-portable.py'), str(moved), '--verify'], capture_output=True, text=True)
+    check = subprocess.run([sys.executable, str(ROOT / 'scripts/export-portable.py'), str(moved), '--verify', '--verify-workers', '4'], capture_output=True, text=True)
     assert check.returncode != 0 and 'verification failed' in check.stderr
 
 

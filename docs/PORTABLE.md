@@ -107,6 +107,8 @@ python scripts/package-portable.py /新磁盘/AtlasPortable
 
 Mac 空间不足时，`export-portable.py --clone-staging` 使用 APFS 独立克隆作为暂存，不需要先物理复制一份全量资产。克隆仍会做哈希检查；更改原文件不会修改已建立的克隆。非 APFS 目标会回退普通复制，因此应先检查空间。大量文件可用 `--capture-workers 4` 设置 1–8 个并发读取，队列按 500 个文件分批；不减少发布前的完整校验。
 
+完整校验可使用 `--verify-workers 4`（1–8），每批最多 500 个任务并行读回全部文件并计算 SHA-256。适用于导出、`--verify` 和 `--publish-received`；任一文件不符仍阻止发布，不使用旧校验收据跳过内容读取。
+
 `copy-portable-ssh.py` 配合 `portable-receive.py` 使用带大小和 SHA-256 的二进制流，按内容续传；目标地址、Python 命令、盘符及目录均由部署参数指定。接收器拒绝覆盖已发布或正在运行的库，不写其他磁盘目录。`--objects-only` 可提前传输已经冻结的内容对象；完整复制将启动指针存成 `portable.pending.json`。完成卷缓存刷新后，在目标执行 `export-portable.py /目标目录 --publish-received --require-platform Windows-AMD64 --require-platform Darwin-arm64`：检查运行包、应用包、目录库、全部内容与 Git 后，自动原子发布并记录报告。不能仅凭复制命令成功就发布；发布后仍须完成真实运行验收。
 
 Win/mac 的实际换盘验收需要先安全停止、通过系统弹出，再接入另一台机器。SSH 验证 Windows 读写不代替 Mac 上的实际挂盘验收；若接入主机安全策略拦截读写，须正常放行后才能完成该项验收。

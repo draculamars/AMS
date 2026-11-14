@@ -217,7 +217,7 @@ def git_snapshot(repo, catalog, archive, repositories=()):
     return destination
 
 
-def export(root, source_catalog, source_archive, resume=False, refresh=True, web_imports=(), capture_workers=1):
+def export(root, source_catalog, source_archive, resume=False, refresh=True, web_imports=(), capture_workers=1, verify_workers=1):
     root, source_catalog, source_archive = [Path(p).expanduser().resolve() for p in (root, source_catalog, source_archive)]
     if root == Path('/') or root == Path.home() or root.is_relative_to(source_catalog) or root.is_relative_to(source_archive):
         raise ValueError('Choose a new dedicated portable directory')
@@ -413,7 +413,7 @@ def export(root, source_catalog, source_archive, resume=False, refresh=True, web
         c.execute('PRAGMA journal_mode=DELETE').fetchall()
     c.close()
     atomic_json(root/'reports/git-coverage.json',{'unavailable_retired_repositories':unavailable})
-    report = verify(root, catalog)
+    report = verify(root, catalog, workers=verify_workers)
     config = {'format': 1, 'id': state['id'], 'active_dataset': catalog.parent.relative_to(root).as_posix(),
               'captured_at': stamp(), 'started_at': state['started_at'], 'coverage': report, 'encrypted':False,
               'note': 'File-stable capture interval; not a filesystem-wide atomic snapshot. Existing parser coverage and missing dependencies are preserved. Remote-only data is not included.'}
@@ -425,7 +425,7 @@ def export(root, source_catalog, source_archive, resume=False, refresh=True, web
     return config
 
 
-def verify(root, catalog=None):
+def verify(root, catalog=None, workers=1):
     root = Path(root).resolve()
     if catalog is None:
         pointer = root/'portable.json'
@@ -458,16 +458,24 @@ def verify(root, catalog=None):
         for item in json.loads(raw)['files'].values():
             if item['sha256'] in objects and objects[item['sha256']] != item['size']: raise ValueError('Conflicting web size')
             objects[item['sha256']] = item['size']
-    total = 0
-    for i, (sha, size) in enumerate(objects.items()):
+    def check_object(item):
+        sha,size=item
         if not re.fullmatch('[0-9a-f]{64}', sha):
             raise ValueError('Invalid object digest')
         path = root / 'archive' / sha[:2] / sha
         if path.is_symlink() or not path.is_file() or path.stat().st_size != size or digest(path) != sha:
             raise ValueError('Object verification failed: ' + sha)
-        total += size
-        if i % 2000 == 0:
-            emit(phase='verify', done=i, total=len(objects), bytes=total)
+        return size
+    total = 0; done = 0
+    items=list(objects.items())
+    emit(phase='verify',done=0,total=len(items),bytes=0,workers=workers)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        # Bound submitted work and memory; every object still receives a full
+        # SHA-256 check. No cached receipt substitutes for reading the file.
+        for start in range(0,len(items),500):
+            for size in pool.map(check_object,items[start:start+500]):
+                total+=size;done+=1
+            emit(phase='verify',done=done,total=len(items),bytes=total)
     import gzip
     for (name,) in runs:
         if Path(name).name != name:
@@ -483,7 +491,7 @@ def verify(root, catalog=None):
     return {**report, 'objects': len(objects), 'object_bytes': total, 'content_sha256': 'all-passed', 'database': 'integrity_check+foreign_key_check passed', 'checked_at': stamp()}
 
 
-def publish_received(root, platforms):
+def publish_received(root, platforms, verify_workers=1):
     root=Path(root).resolve()
     if (root/'portable.json').exists() or (root/'session.json').exists(): raise ValueError('Destination is already published or active')
     config=json.loads((root/'portable.pending.json').read_text(encoding='utf-8'))
@@ -496,7 +504,7 @@ def publish_received(root, platforms):
         if Path(info['file']).name!=info['file'] or digest(root/'runtimes'/info['file'])!=info['sha256']: raise ValueError('Runtime checksum mismatch: '+name)
     for name in ['launcher.py','start.sh','start.cmd','Stop Atlas.cmd','Stop Atlas.command']:
         if not (root/name).is_file(): raise ValueError('Portable launcher missing: '+name)
-    result=verify(root)
+    result=verify(root, workers=verify_workers)
     atomic_json(root/'reports/received-verification.json',result)
     os.replace(root/'portable.pending.json',root/'portable.json')
     transfer.update(status='complete',verified_at=stamp(),encrypted=False)
@@ -515,17 +523,18 @@ if __name__ == '__main__':
     parser.add_argument('--web-publication', type=Path, action='append', default=[], help='Frozen publication.json with sibling objects.json source map')
     parser.add_argument('--clone-staging', action='store_true', help='Use independent APFS clones for local staging on macOS')
     parser.add_argument('--capture-workers',type=int,choices=range(1,9),default=1,help='Bounded concurrent file captures (1–8)')
+    parser.add_argument('--verify-workers',type=int,choices=range(1,9),default=1,help='Bounded concurrent full SHA-256 reads (1–8)')
     parser.add_argument('--publish-received', action='store_true')
     parser.add_argument('--require-platform', action='append', default=[])
     args = parser.parse_args()
     if args.publish_received:
-        emit(phase='received-library-published',**publish_received(args.destination,args.require_platform))
+        emit(phase='received-library-published',**publish_received(args.destination,args.require_platform,args.verify_workers))
     elif args.verify:
-        result = verify(args.destination)
+        result = verify(args.destination,workers=args.verify_workers)
         atomic_json(args.destination / 'reports' / 'verification.json', result)
         emit(phase='verified', **result)
     else:
         if not args.source_catalog or not args.source_archive:
             parser.error('--source-catalog and --source-archive required')
         if args.clone_staging: os.environ['ATLAS_COPY_MODE'] = 'clone'
-        export(args.destination, args.source_catalog, args.source_archive, args.resume, not args.no_refresh, args.web_publication,args.capture_workers)
+        export(args.destination, args.source_catalog, args.source_archive, args.resume, not args.no_refresh, args.web_publication,args.capture_workers,args.verify_workers)
