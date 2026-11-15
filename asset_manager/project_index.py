@@ -158,6 +158,7 @@ def index_one(pid,progress=lambda *a:None,rescan=True):
                 if a.get('_analysis_note'):coverage['含动态路径的脚本']+=1
             for ref,kind in refs:
                 target_pid,target_path,status=resolve_fast(a['relpath'],ref)
+                status=models.reference_status(status,kind)
                 # Standard-library and external package imports are not missing local files.
                 if kind=='imports' and status=='missing':continue
                 if status=='anchor':continue

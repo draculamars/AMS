@@ -90,3 +90,43 @@ for source,name,role in [(P/'references/source.STEP','copy.STEP','original')]:
     assert ('project://references/source.STEP', 'build_input') in refs
     assert ('project://copy.STEP', 'build_output') in refs
     assert not (env/'NEVER_EXECUTE.txt').exists()
+
+
+def test_missing_inputs_are_distinct_from_declared_outputs_and_temporaries(env, client, monkeypatch):
+    put(env, 'robot/main.urdf', '<robot/>')
+    put(env, 'robot/build.py', '''from pathlib import Path
+P=Path(__file__).parent
+(P/'required.tmp').read_bytes()
+(P/'required.tmp').unlink()
+(P/'result.step').write_bytes(b'output')
+back=P/'readback.tmp'
+call('download', '--output', str(back))
+back.read_bytes()
+back.unlink()
+''')
+    # A different consumer still needs the temporary file as a real input.
+    put(env, 'robot/consumer.py', "from pathlib import Path\n(Path(__file__).parent/'readback.tmp').read_bytes()")
+    rows = freeze(env, monkeypatch)
+    mid = models.list_projects()['items'][0]['id']
+    d = models.detail(mid)
+    assert d['missing'] == 2
+    assert d['unarchived_outputs'] == 1 and d['unarchived_intermediates'] == 1
+    assert len(d['links']) == 4
+    expected = {('robot/build.py', 'project://robot/required.tmp'): 'missing',
+                ('robot/build.py', 'project://robot/result.step'): 'output_unarchived',
+                ('robot/build.py', 'project://robot/readback.tmp'): 'temporary_unarchived',
+                ('robot/consumer.py', 'project://robot/readback.tmp'): 'missing'}
+    paths = {a['id']: a['relpath'] for a in d['files']}
+    assert {(paths[r['source']], r['reference']): r['status'] for r in d['links']} == expected
+    result = library_index.refresh([a['id'] for a in rows.values()])
+    assert result['status'] == 'complete'
+    assert {(r['source_path'], r['reference']): r['status'] for r in project_index.relations('p')['items']} == expected
+    snap = models.snapshot(lambda *a: None, mid)
+    assert models.get_snapshot(mid, snap['snapshot_id'])['links'] == d['links']
+    assert not (env/'robot/result.step').exists()
+    url = '/api/model-projects/'+mid
+    plan = client.post(url+'/upload-plan', headers=HEADERS, files={'file': ('update.zip', zip_bytes({'result.step': 'new output'}))}).json()
+    r = client.post(url+'/upload-apply', headers=HEADERS, json={'plan_id': plan['id']})
+    assert r.status_code == 200, r.text
+    assert models.detail(mid)['unarchived_outputs'] == 0
+    assert next(r for r in project_index.relations('p')['items'] if r['reference'].endswith('result.step'))['status'] == 'resolved'

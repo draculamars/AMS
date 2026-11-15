@@ -185,6 +185,14 @@ def resolve_reference(project_id,source,ref):
         hit=exact(posixpath.join(posixpath.dirname(source),ref[2:] if ref.startswith('//') else ref))
         return hit,'relative' if hit else 'missing'
 
+def reference_status(method,relation):
+    # Missing declared outputs are not missing source dependencies. Preserve
+    # them visibly: static analysis cannot assert that a build ever succeeded.
+    if method=='missing':
+        if relation=='build_output':return 'output_unarchived'
+        if relation=='build_intermediate':return 'temporary_unarchived'
+    return method
+
 def detail(mid):
     g=group(mid);files=scoped_assets(g);byid={a['id']:a for a in files};links=[];coverage=[];queue=list(files);seen=set()
     with db.connect() as c:manual=[dict(r) for r in c.execute('SELECT * FROM model_relations WHERE model_id=?',(mid,))]
@@ -200,7 +208,7 @@ def detail(mid):
             try:
                 for ref,relation in references(a):
                     target,method=resolve_reference(g['project_id'],a['relpath'],ref)
-                    links.append({'source':a['id'],'target':target['id'] if target else None,'reference':ref,'relation':relation,'status':'resolved' if target else method,'evidence':method})
+                    links.append({'source':a['id'],'target':target['id'] if target else None,'reference':ref,'relation':relation,'status':'resolved' if target else reference_status(method,relation),'evidence':method})
                     if target and target['id'] not in byid:byid[target['id']]=target;queue.append(target)
                 if a.get('_analysis_note'):coverage.append({'asset_id':a['id'],'message':a['_analysis_note']})
             except (OSError,ValueError,ET.ParseError) as e:coverage.append({'asset_id':a['id'],'message':str(e)[:300]})
@@ -237,7 +245,7 @@ def detail(mid):
         if a['ext'] in GEOMETRY and other_root!=g['root']:
             other_id=hashlib.sha256((a['project_id']+'\0'+other_root).encode()).hexdigest()[:24]
             if other_id in catalog():related[other_id]={'id':other_id,'title':catalog()[other_id]['title'],'root':other_root}
-    return {**{k:v for k,v in g.items() if k!='models'},'files':files,'links':links,'associations':associations,'coverage':coverage,'snapshots':snapshots,'related_projects':list(related.values()),'missing':sum(not r['target'] for r in links),'bytes':sum(a['size'] for a in files)}
+    return {**{k:v for k,v in g.items() if k!='models'},'files':files,'links':links,'associations':associations,'coverage':coverage,'snapshots':snapshots,'related_projects':list(related.values()),'missing':sum(not r['target'] and r['status'] not in {'output_unarchived','temporary_unarchived'} for r in links),'unarchived_outputs':sum(r['status']=='output_unarchived' for r in links),'unarchived_intermediates':sum(r['status']=='temporary_unarchived' for r in links),'bytes':sum(a['size'] for a in files)}
 
 def save_settings(mid,body):
     g=group(mid);entry=int(body.get('entry_asset_id') or g['entry']['id'])

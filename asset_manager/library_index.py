@@ -43,6 +43,7 @@ def refresh(asset_ids):
                 documents.append((a['project_id'], a['relpath'], title, text[:16384], int(len(text) > 16384)))
             for ref, kind in refs:
                 pid, target, status = index.resolve(a['project_id'], a['relpath'], ref, lookup, projects, dirs)
+                status = models.reference_status(status, kind)
                 if status == 'anchor' or (kind == 'imports' and status == 'missing'):
                     continue
                 key = hashlib.sha256(json.dumps([a['project_id'], a['relpath'], ref, kind], ensure_ascii=False).encode()).hexdigest()[:32]
@@ -60,7 +61,7 @@ def refresh(asset_ids):
         c.executemany('INSERT OR REPLACE INTO project_documents VALUES(?,?,?,?,?)', documents)
         # Added files can satisfy previously missing incoming references too.
         for pid in affected:
-            for row in c.execute("SELECT * FROM project_relations WHERE source_project=? AND manual=0 AND status='missing'", (pid,)).fetchall():
+            for row in c.execute("SELECT * FROM project_relations WHERE source_project=? AND manual=0 AND status IN ('missing','output_unarchived','temporary_unarchived')", (pid,)).fetchall():
                 target_pid, target, status = index.resolve(pid, row['source_path'], row['reference'], lookup, projects, dirs)
                 if target is not None:
                     c.execute('UPDATE project_relations SET target_project=?,target_path=?,status=?,evidence=? WHERE id=?',

@@ -77,6 +77,18 @@ def script_references(asset,text):
             if not isinstance(n,ast.Call):continue
             name=dotted(n.func);last=name.rsplit('.',1)[-1]
             kw={k.arg:k.value for k in n.keywords}
+            # A literal CLI output flag is a declaration, never proof of execution.
+            # Keep it distinct until a read AND explicit cleanup of the same path
+            # establish a temporary-file contract within this script.
+            args=n.args
+            if name in {'subprocess.run','subprocess.call','subprocess.check_call','subprocess.check_output'} and args and isinstance(args[0],(ast.List,ast.Tuple)):
+                args=args[0].elts
+            for flag,value in zip(args,args[1:]):
+                if isinstance(flag,ast.Constant) and flag.value=='--output':
+                    record(evaluate(value,values),'command_output')
+            if isinstance(n.func,ast.Attribute) and last=='unlink':
+                base=evaluate(n.func.value,values)
+                if isinstance(base,PurePosixPath):record(base,'build_cleanup')
             if isinstance(n.func,ast.Attribute) and last in {'read_text','read_bytes','write_text','write_bytes'}:
                 base=evaluate(n.func.value,values)
                 if isinstance(base,PurePosixPath):record(base,'build_input' if last.startswith('read') else 'build_output')
@@ -113,4 +125,8 @@ def script_references(asset,text):
             elif isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef)):statements(node.body,dict(values),depth+1)
             else:calls(node,values)
     statements(tree.body,env)
+    outputs={p for p,k in found if k in {'command_output','build_output'}}
+    cleaned={p for p,k in found if k=='build_cleanup'}
+    temporary=outputs & cleaned & {p for p,k in found if k=='build_input'}
+    found={(p,'build_intermediate' if p in temporary and k in {'build_input','build_output','command_output'} else 'build_output' if k=='command_output' else k) for p,k in found if k!='build_cleanup'}
     return sorted(found),dynamic
