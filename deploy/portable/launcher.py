@@ -111,10 +111,15 @@ def stop(root):
     # A file request works without killing Windows' process or requiring a web
     # password. Only the holder of this library's current session consumes it.
     atomic_json(root / '.stop-request.json', {'nonce': state['nonce'], 'host': state['host']})
-    for _ in range(120):
+    deadline = time.monotonic() + 300
+    next_notice = time.monotonic() + 10
+    while time.monotonic() < deadline:
         if not path.exists():
             print('Atlas stopped; catalog saved. You may now eject the disk using the operating system.')
             return
+        if time.monotonic() >= next_notice:
+            print('Atlas is closing and saving its catalog. Keep the disk attached; waiting for confirmation.', flush=True)
+            next_notice = time.monotonic() + 10
         time.sleep(0.25)
     raise ValueError('Service is still closing. Keep the disk attached and inspect its terminal.')
 

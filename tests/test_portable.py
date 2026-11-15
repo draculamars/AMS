@@ -101,6 +101,35 @@ def test_portable_manifest_verification_under_windows_legacy_encoding(env, tmp_p
     assert module.verify(target)['database'] == 'integrity_check+foreign_key_check passed'
 
 
+def test_native_stop_waits_for_large_catalog_shutdown(tmp_path, monkeypatch, capsys):
+    spec = importlib.util.spec_from_file_location('portable_launcher_slow_stop', ROOT / 'deploy/portable/launcher.py')
+    launcher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(launcher)
+    catalog = tmp_path / 'datasets/test/catalog'
+    catalog.mkdir(parents=True)
+    with sqlite3.connect(catalog / 'catalog.sqlite3') as c:
+        c.execute('CREATE TABLE jobs(status TEXT)')
+    session = tmp_path / 'session.json'
+    session.write_text(json.dumps({'host': 'test-host', 'nonce': 'test-nonce', 'pid': 123,
+                                   'port': 8770, 'dataset': 'datasets/test'}))
+    monkeypatch.setattr(launcher, 'host_key', lambda: 'test-host')
+    monkeypatch.setattr(launcher, 'health', lambda port: {'portable_session': 'test-nonce', 'portable_pid': 123})
+    elapsed = [0.0]
+
+    def simulated_wait(seconds):
+        elapsed[0] += seconds
+        if elapsed[0] >= 35:
+            session.unlink(missing_ok=True)
+
+    monkeypatch.setattr(launcher.time, 'monotonic', lambda: elapsed[0])
+    monkeypatch.setattr(launcher.time, 'sleep', simulated_wait)
+    launcher.stop(tmp_path)
+    output = capsys.readouterr().out
+    assert elapsed[0] >= 35
+    assert 'waiting for confirmation' in output
+    assert 'You may now eject' in output
+
+
 def test_failed_missing_history_is_not_published_then_resume(env, tmp_path):
     put(env, 'a.txt', 'history')
     core.scan_project('p')
