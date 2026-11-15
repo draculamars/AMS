@@ -303,7 +303,8 @@ def upload(project_id,filename,stream,asset_id=None):
         con.execute('INSERT OR IGNORE INTO versions(asset_id,sha256,size,reason) VALUES(?,?,?,?)',
                     (asset_id,sha,size,'update' if 'a' in locals() else 'upload'))
         db.audit(con,'upload',{'asset_id':asset_id,'sha256':sha,'size':size})
-    return {'asset_id':asset_id,'sha256':sha,'size':size}
+    from . import library_index
+    return {'asset_id':asset_id,'sha256':sha,'size':size,**library_index.after_upload([asset_id])}
 
 def run_job(kind, function, *args):
     jid=uuid.uuid4().hex

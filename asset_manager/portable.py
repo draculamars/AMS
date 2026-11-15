@@ -44,7 +44,7 @@ def request_allowed(method, path):
         return False
     if method in {'GET', 'HEAD', 'OPTIONS'}:
         return True
-    if path in {'/api/auth/login', '/api/auth/logout', '/api/auth/setup', '/api/upload', '/api/archive', '/api/portable/stop', '/api/portable/backup'}:
+    if path in {'/api/auth/login', '/api/auth/logout', '/api/auth/setup', '/api/upload', '/api/archive', '/api/portable/stop', '/api/portable/backup', '/api/portable/refresh-index'}:
         return method == 'POST'
     allowed = {
         'PATCH': [r'/api/assets/\d+', r'/api/model-projects/[^/]+'],

@@ -179,4 +179,7 @@ def apply(mid, pid):
         db.audit(c, 'engineering_upload', {'model_id': mid, 'plan_id': pid, 'files': changed})
     shutil.rmtree(folder)
     models.catalog(True)
-    return {'updated': len(stored), 'unchanged': len(plan['files']) - len(stored)}
+    from . import library_index
+    with db.connect() as c:
+        ids = [c.execute('SELECT id FROM assets WHERE project_id=? AND relpath=?', (plan['project_id'], row['path'])).fetchone()[0] for row in plan['files']]
+    return {'updated': len(stored), 'unchanged': len(plan['files']) - len(stored), **library_index.after_upload(ids)}

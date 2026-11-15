@@ -20,6 +20,9 @@ def script_references(asset,text):
         if isinstance(node,ast.Constant):return node.value if isinstance(node.value,(str,int,float,bool,type(None))) else None
         if isinstance(node,ast.Name):return values.get(node.id)
         if isinstance(node,(ast.List,ast.Tuple)):return [evaluate(n,values) for n in node.elts]
+        if isinstance(node,ast.UnaryOp) and isinstance(node.op,(ast.USub,ast.UAdd)):
+            value=evaluate(node.operand,values)
+            if type(value) in (int,float):return -value if isinstance(node.op,ast.USub) else value
         if isinstance(node,ast.JoinedStr):
             parts=[evaluate(n.value,values) if isinstance(n,ast.FormattedValue) else evaluate(n,values) for n in node.values]
             return ''.join(str(p) for p in parts) if all(p is not None for p in parts) else None
@@ -80,7 +83,7 @@ def script_references(asset,text):
             elif name in {'shutil.copytree','shutil.copy2','shutil.copyfile'} and len(n.args)>=2:
                 record(evaluate(n.args[0],values),'build_input',name.endswith('copytree'))
                 if not name.endswith('copytree'):record(evaluate(n.args[1],values),'build_output')
-            elif 'importers.import' in name or last in {'load_mesh','load_meshes'}:
+            elif 'importers.import' in name or last in {'load_mesh','load_meshes'} or name in {'trimesh.load','trimesh.load_scene'}:
                 if n.args:record(evaluate(n.args[0],values),'build_input')
             elif 'exporters.export' in name and len(n.args)>=2:record(evaluate(n.args[1],values),'build_output')
             elif name.startswith('bpy.ops.') and 'filepath' in kw:
@@ -96,8 +99,13 @@ def script_references(asset,text):
                 calls(node.value,values)
             elif isinstance(node,ast.For):
                 items=evaluate(node.iter,values)
-                if isinstance(items,list) and len(items)<=500 and isinstance(node.target,ast.Name):
-                    for item in items:statements(node.body,{**values,node.target.id:item},depth+1)
+                if isinstance(items,list) and len(items)<=500:
+                    def bind(target,item,scope):
+                        if isinstance(target,ast.Name):scope[target.id]=item
+                        elif isinstance(target,(ast.Tuple,ast.List)) and isinstance(item,list) and len(target.elts)==len(item):
+                            for child,value in zip(target.elts,item):bind(child,value,scope)
+                    for item in items:
+                        scope=dict(values);bind(node.target,item,scope);statements(node.body,scope,depth+1)
                 else:statements(node.body,dict(values),depth+1)
             elif isinstance(node,ast.If):
                 # Both branches are references, not executed control flow.

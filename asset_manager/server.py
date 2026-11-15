@@ -139,6 +139,15 @@ def portable_backups():
     from . import portable_backup
     return portable_backup.listing()
 
+@app.post('/api/portable/refresh-index')
+def portable_refresh_index(body:dict):
+    from . import library_index, portable_backup
+    portable_backup.root()
+    ids=body.get('asset_ids')
+    if not isinstance(ids,list) or not 1<=len(ids)<=5000 or any(type(i) is not int or i<1 for i in ids):
+        raise ValueError('资产列表须包含 1–5000 个有效编号')
+    return {'job_id':core.run_job('library_index_refresh',library_index.refresh_job,ids)}
+
 @app.post('/api/portable/backup')
 def portable_backup():
     from . import portable_backup as backup
