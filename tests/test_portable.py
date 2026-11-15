@@ -80,6 +80,27 @@ def test_export_refuses_existing_directory_and_published_overwrite(env, tmp_path
     assert run_export(clean, db.DATA, db.blob_root(), '--resume').returncode != 0
 
 
+def test_portable_manifest_verification_under_windows_legacy_encoding(env, tmp_path, monkeypatch):
+    import gzip
+    put(env, '设计/模型说明.md', '# 中文工程说明\n')
+    project_index.index_one('p')
+    target = tmp_path / 'portable'
+    result = run_export(target, db.DATA, db.blob_root())
+    assert result.returncode == 0, result.stderr
+    spec = importlib.util.spec_from_file_location('portable_export_locale', ROOT / 'scripts/export-portable.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    original_open = gzip.open
+
+    def legacy_open(filename, mode='rb', *args, **kwargs):
+        if 't' in mode and not kwargs.get('encoding'):
+            kwargs['encoding'] = 'gbk'
+        return original_open(filename, mode, *args, **kwargs)
+
+    monkeypatch.setattr(gzip, 'open', legacy_open)
+    assert module.verify(target)['database'] == 'integrity_check+foreign_key_check passed'
+
+
 def test_failed_missing_history_is_not_published_then_resume(env, tmp_path):
     put(env, 'a.txt', 'history')
     core.scan_project('p')

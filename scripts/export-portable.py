@@ -233,7 +233,7 @@ def export(root, source_catalog, source_archive, resume=False, refresh=True, web
     if root.exists():
         if not resume or not marker.is_file():
             raise ValueError('Destination already exists; only an unfinished Atlas export supports --resume')
-        state = json.loads(marker.read_text())
+        state = json.loads(marker.read_text(encoding='utf-8'))
         if state.get('format')!=1 or not re.fullmatch('[0-9a-f]{32}',state.get('id','')):
             raise ValueError('Invalid export identity')
         if state['status'] == 'complete' or (root / 'portable.json').exists():
@@ -488,7 +488,7 @@ def verify(root, catalog=None, workers=1):
     for (name,) in runs:
         if Path(name).name != name:
             raise ValueError('Unsafe manifest path')
-        with gzip.open(Path(catalog) / 'project-index' / name, 'rt') as f:
+        with gzip.open(Path(catalog) / 'project-index' / name, 'rt', encoding='utf-8') as f:
             json.load(f)
     for key in git_keys:
         if not re.fullmatch('[0-9a-f]{64}', key):

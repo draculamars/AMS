@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.1-portable.4 — 2026-11-15
+
+- 导出续传状态和压缩工程索引明确按 UTF-8 读取，修复中文 Windows 默认 GBK 编码导致的导出与离线校验失败。增加非 UTF-8 默认编码的回归测试。
+
 ## 0.6.1-portable.3 — 2026-11-15
 
 - Windows SSH 接收、续传清单与发布前哈希校验使用扩展文件路径，保留超过 260 字符的 Codex Git checkpoint 引用；不修改 Windows 长路径策略。
