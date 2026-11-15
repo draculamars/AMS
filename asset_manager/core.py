@@ -302,6 +302,8 @@ def upload(project_id,filename,stream,asset_id=None):
             asset_id=cur.lastrowid
         con.execute('INSERT OR IGNORE INTO versions(asset_id,sha256,size,reason) VALUES(?,?,?,?)',
                     (asset_id,sha,size,'update' if 'a' in locals() else 'upload'))
+        if os.environ.get('ATLAS_PORTABLE_ROOT'):
+            con.execute('UPDATE assets SET size=? WHERE id=?',(size,asset_id))
         db.audit(con,'upload',{'asset_id':asset_id,'sha256':sha,'size':size})
     from . import library_index
     return {'asset_id':asset_id,'sha256':sha,'size':size,**library_index.after_upload([asset_id])}

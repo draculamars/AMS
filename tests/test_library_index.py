@@ -34,6 +34,7 @@ def test_upload_refreshes_documents_links_preserves_manual_and_history(env, clie
     assert any(x['manual'] and x['target_path'] == 'old.stl' for x in links)
     assert {x['target_path'] for x in links if not x['manual']} == {'new.stl'}
     assert project_index.documents('p', 'needlecontent')['total'] == 1
+    assert core.asset_row(aid)['size'] == len(b'# New title\n[new](new.stl)\nneedlecontent')
     versions = client.get(f'/api/assets/{aid}').json()['versions']
     assert client.get(f'/api/assets/{aid}/file?version={versions[-1]["id"]}').text == original
     assert (env/'README.md').read_text() == original
@@ -130,3 +131,33 @@ back.unlink()
     assert r.status_code == 200, r.text
     assert models.detail(mid)['unarchived_outputs'] == 0
     assert next(r for r in project_index.relations('p')['items'] if r['reference'].endswith('result.step'))['status'] == 'resolved'
+
+
+def test_bundle_size_uses_actual_current_bytes_and_refresh_repairs_old_catalog(env, client, monkeypatch):
+    import zipfile
+    put(env, 'robot/main.urdf', '<robot/>')
+    put(env, 'robot/README.md', 'old')
+    rows = freeze(env, monkeypatch)
+    mid = models.list_projects()['items'][0]['id']
+    before = models.snapshot(lambda *a: None, mid)
+    content = '# updated document with a different size\n'
+    url = '/api/model-projects/'+mid
+    plan = client.post(url+'/upload-plan', headers=HEADERS, files={'file': ('update.zip', zip_bytes({'README.md': content}))}).json()
+    result = client.post(url+'/upload-apply', headers=HEADERS, json={'plan_id': plan['id']})
+    assert result.status_code == 200, result.text
+    aid = rows['robot/README.md']['id']
+    assert core.asset_row(aid)['size'] == len(content.encode())
+    with db.connect() as c:
+        c.execute('UPDATE assets SET size=3 WHERE id=?', (aid,))  # older deployment
+    bundle, _ = models.bundle(mid)
+    try:
+        with zipfile.ZipFile(bundle) as z:
+            manifest = json.loads(z.read('ATLAS-ENGINEERING-MANIFEST.json'))
+            for f in manifest['files']:
+                assert f['size'] == z.getinfo('project/'+f['path']).file_size
+    finally:
+        __import__('os').unlink(bundle)
+    library_index.refresh([aid])
+    assert core.asset_row(aid)['size'] == len(content.encode())
+    old = next(f for f in models.get_snapshot(mid, before['snapshot_id'])['files'] if f['id'] == aid)
+    assert old['size'] == 3 and (env/'robot/README.md').read_text() == 'old'

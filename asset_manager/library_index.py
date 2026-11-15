@@ -54,6 +54,11 @@ def refresh(asset_ids):
     repaired = 0
     with db.connect() as c:
         for a in assets:
+            # Repair metadata left by older portable uploads; historical index
+            # snapshots and version sizes are retained independently.
+            current = c.execute("SELECT size FROM versions WHERE asset_id=? AND reason IN ('upload','update') ORDER BY id DESC LIMIT 1", (a['id'],)).fetchone()
+            if current:
+                c.execute('UPDATE assets SET size=? WHERE id=?', (current[0], a['id']))
             # Old generated links must not masquerade as the new content.
             c.execute('DELETE FROM project_relations WHERE source_project=? AND source_path=? AND manual=0', (a['project_id'], a['relpath']))
             c.execute('DELETE FROM project_documents WHERE project_id=? AND path=?', (a['project_id'], a['relpath']))

@@ -303,7 +303,7 @@ def bundle(mid,sid=None):
                     for chunk in iter(lambda:src.read(1024*1024),b''):h.update(chunk);dst.write(chunk)
                 after=path.stat()
                 if (before.st_size,before.st_mtime_ns)!=(after.st_size,after.st_mtime_ns) or (a.get('sha256') and a['sha256']!=h.hexdigest()):raise ValueError('工程文件变化或校验失败，请重试')
-                if not sid:manifest['files'].append({**a,'sha256':h.hexdigest()})
+                if not sid:manifest['files'].append({**a,'size':before.st_size,'sha256':h.hexdigest()})
             z.writestr('ATLAS-ENGINEERING-MANIFEST.json',json.dumps(manifest,ensure_ascii=False,indent=2))
         return tmp,manifest['title']
     except BaseException:

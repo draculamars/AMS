@@ -176,6 +176,8 @@ def apply(mid, pid):
                 aid = c.execute("INSERT INTO assets(project_id,relpath,name,ext,kind,size,mtime,git_state,managed,present) VALUES(?,?,?,?,?,?,?,'managed',1,0)",
                                 (plan['project_id'], row['path'], name, ext, core.EXT_KIND.get(ext, 'other'), row['size'], time.time())).lastrowid
             c.execute('INSERT INTO versions(asset_id,sha256,size,reason) VALUES(?,?,?,?)', (aid, row['sha256'], row['size'], 'update' if row['id'] else 'upload'))
+            if os.environ.get('ATLAS_PORTABLE_ROOT'):
+                c.execute('UPDATE assets SET size=? WHERE id=?', (row['size'], aid))
         db.audit(c, 'engineering_upload', {'model_id': mid, 'plan_id': pid, 'files': changed})
     shutil.rmtree(folder)
     models.catalog(True)
