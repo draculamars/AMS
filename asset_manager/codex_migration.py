@@ -4,6 +4,8 @@ Workers outlive web requests. No source deletion, blind destination overwrite,
 password collection, or migration of live RAM/swap is provided by this module.
 """
 import base64
+import collections
+import concurrent.futures
 import contextlib
 import functools
 import hashlib
@@ -409,13 +411,38 @@ def snapshot_file(path, destination, preserve_mode=False):
             'xattrs': agent.attributes(destination), 'captured_at': time.time()}
 
 
+def _manifest_entry(p, home, relative_root):
+    st = p.lstat()
+    item = {'path': p.relative_to(home).as_posix(), 'mode': stat.S_IMODE(st.st_mode)}
+    link = None
+    if not p.is_symlink():
+        item['xattrs'] = agent.attributes(p)
+    if p.is_symlink():
+        target = os.readlink(p)
+        item.update(type='symlink', target=target)
+        if os.path.isabs(target) or not p.exists():
+            link = {'path': item['path'], 'target': target, 'broken_at_source': not p.exists()}
+    elif stat.S_ISDIR(st.st_mode):
+        item['type'] = 'directory'
+    elif stat.S_ISREG(st.st_mode):
+        item.update(type='file', size=st.st_size, sha256=agent.digest(p))
+        if st.st_nlink > 1:
+            item['hardlink_group'] = relative_root + ':' + str(st.st_dev) + ':' + str(st.st_ino)
+        after = p.stat()
+        if (st.st_size, st.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+            raise ValueError('清单捕获时文件变化，请续传重试：' + str(p))
+    else:
+        return None, None
+    return item, link
+
+
 def make_manifest(plan):
     home = Path(plan['source_home'])
     path = folder(plan['id']) / 'source-manifest.jsonl'
     files = 0
     size = 0
     links = []
-    with path.open('w', encoding='utf-8') as out:
+    def paths():
         for row in plan['roots']:
             root = Path(row['source'])
             for base, dirs, names in os.walk(root, followlinks=False):
@@ -424,34 +451,34 @@ def make_manifest(plan):
                 for p in [base] + [base / d for d in dirs if (base / d).is_symlink()] + [base / n for n in sorted(names)]:
                     if filtered(plan, p):
                         continue
-                    st = p.lstat()
-                    item = {'path': p.relative_to(home).as_posix(), 'mode': stat.S_IMODE(st.st_mode)}
-                    if not p.is_symlink():
-                        item['xattrs'] = agent.attributes(p)
-                    if p.is_symlink():
-                        target = os.readlink(p)
-                        item.update(type='symlink', target=target)
-                        if os.path.isabs(target) or not p.exists():
-                            links.append({'path': item['path'], 'target': target, 'broken_at_source': not p.exists()})
-                    elif stat.S_ISDIR(st.st_mode):
-                        item['type'] = 'directory'
-                    elif stat.S_ISREG(st.st_mode):
-                        item.update(type='file', size=st.st_size, sha256=agent.digest(p))
-                        if st.st_nlink > 1:
-                            item['hardlink_group'] = row['relative'] + ':' + str(st.st_dev) + ':' + str(st.st_ino)
-                        after = p.stat()
-                        if (st.st_size, st.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
-                            raise ValueError('清单捕获时文件变化，请续传重试：' + str(p))
-                        size += st.st_size
-                    else:
-                        # Socket and FIFO are runtime state, not transferable file contents.
-                        continue
-                    out.write(json.dumps(item, ensure_ascii=False) + '\n')
-                    files += 1
-                    if files % 200 == 0:
-                        if (folder(plan['id']) / 'cancel').exists():
-                            raise InterruptedError('清单捕获已暂停，可续传')
-                        save(plan, progress={'entries_hashed': files, 'bytes_hashed': size})
+                    yield p, row.get('relative', root.relative_to(home).as_posix())
+    # A bounded queue overlaps small-file I/O without retaining the whole tree
+    # or file contents. Output order remains deterministic.
+    with path.open('w', encoding='utf-8') as out, concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        pending = collections.deque()
+        source = iter(paths())
+        exhausted = False
+        while pending or not exhausted:
+            while len(pending) < 8 and not exhausted:
+                try:
+                    p, relative = next(source)
+                    pending.append(pool.submit(_manifest_entry, p, home, relative))
+                except StopIteration:
+                    exhausted = True
+            if not pending:
+                break
+            item, link = pending.popleft().result()
+            if item is None:
+                continue
+            if link:
+                links.append(link)
+            out.write(json.dumps(item, ensure_ascii=False) + '\n')
+            files += 1
+            size += item.get('size', 0)
+            if files % 200 == 0:
+                if (folder(plan['id']) / 'cancel').exists():
+                    raise InterruptedError('清单捕获已暂停，可续传')
+                save(plan, progress={'entries_hashed': files, 'bytes_hashed': size})
         for item in plan.get('database_snapshots', []):
             out.write(json.dumps(item, ensure_ascii=False) + '\n')
             files += 1
@@ -534,7 +561,9 @@ def transfer(ident):
             manifest = make_manifest(plan)
             save(plan, phase='reconcile', detail='核对初次复制后的文件差异')
             for row in plan['roots']:
-                rsync(plan, row['source'] + '/', plan['root'] + '/incoming/' + row['relative'] + '/', log, checksum=True, root=Path(row['source']))
+                # Reconcile normal changes cheaply. The following full SHA-256
+                # verification, not rsync timestamps, is the acceptance gate.
+                rsync(plan, row['source'] + '/', plan['root'] + '/incoming/' + row['relative'] + '/', log, root=Path(row['source']))
             rsync(plan, manifest, plan['root'] + '/evidence/source-manifest.jsonl', log)
             save(plan, phase='verify', detail='目标逐文件 SHA-256、路径、权限与软链接校验')
             result = remote(plan, 'verify', timeout=24 * 3600, restore_xattrs=True,
