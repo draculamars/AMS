@@ -18,6 +18,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 import zlib
@@ -138,6 +139,26 @@ def historical_workspaces(home, codex):
             'source': 'persisted_command_execution_working_directories'}
 
 
+def missing_transient_workspaces(home):
+    home = Path(home)
+    database = home / '.codex/state_5.sqlite'
+    if not database.exists():
+        return []
+    temporary = [Path('/tmp').resolve(), Path('/private/tmp').resolve(), Path(tempfile.gettempdir()).resolve()]
+    missing = []
+    with contextlib.closing(agent.connect_existing(database)) as c:
+        columns = {r[1] for r in c.execute('PRAGMA table_info(threads)')}
+        if not {'id', 'cwd', 'project_id'} <= columns:
+            return []
+        for ident, cwd in c.execute('SELECT id,cwd FROM threads WHERE project_id IS NULL'):
+            path = Path(cwd)
+            if (path.is_absolute() and not path.is_relative_to(home) and not path.exists()
+                    and any(path.resolve().is_relative_to(base) for base in temporary)):
+                missing.append({'id': ident, 'cwd': cwd, 'source_exists': False,
+                    'reason': 'source_missing_transient_workspace', 'checked_at': time.time()})
+    return missing
+
+
 def source_roots(home, codex, discovery=None):
     roots = [codex]
     projectless_containers = set()
@@ -200,6 +221,38 @@ def source_roots(home, codex, discovery=None):
         children = list(root.iterdir()) if root in projectless_containers and root.is_dir() else []
         expanded += children if children and all(p.is_dir() and not p.is_symlink() for p in children) else [root]
     return expanded
+
+
+def user_node_bin(home, roots):
+    """Resolve a captured user Node, including services without interactive PATH."""
+    home = Path(home)
+    def selected(path):
+        return path.is_file() and any(path.is_relative_to(Path(r)) for r in roots)
+    executable = shutil.which('node')
+    if executable and selected(Path(executable)):
+        return Path(executable).parent.relative_to(home).as_posix()
+    alias = home / '.nvm/alias/default'
+    value = alias.read_text().strip() if alias.is_file() else 'node'
+    seen = set()
+    for _ in range(8):
+        if re.fullmatch(r'v?\d+(?:\.\d+){0,2}', value) or value in {'node', 'stable'}:
+            break
+        if value in seen or '..' in Path(value).parts or Path(value).is_absolute():
+            return None
+        seen.add(value)
+        path = home / '.nvm/alias' / value
+        if not path.is_file():
+            return None
+        value = path.read_text().strip()
+    prefix = tuple(map(int, value.lstrip('v').split('.'))) if re.fullmatch(r'v?\d+(?:\.\d+){0,2}', value) else ()
+    versions = []
+    for path in (home / '.nvm/versions/node').glob('v*/bin/node'):
+        match = re.fullmatch(r'v(\d+)\.(\d+)\.(\d+)', path.parent.parent.name)
+        if match and selected(path):
+            version = tuple(map(int, match.groups()))
+            if version[:len(prefix)] == prefix:
+                versions.append((version, path))
+    return max(versions)[1].parent.relative_to(home).as_posix() if versions else None
 
 
 def database_paths(roots, codex):
@@ -303,6 +356,7 @@ def make_plan(body):
             'created_at': time.time(), 'progress': {}, 'source_deleted': False, 'activation': 'not_started'}
     plan['desktop_archives'] = desktop_archives(home)
     plan['historical_workspace_discovery'] = discovery
+    plan['source_missing_transient_workspaces'] = missing_transient_workspaces(home)
     bins = []
     for name in ['node', 'npm', 'uv', 'uvx', 'hf', 'lark-cli']:
         executable = shutil.which(name)
@@ -311,6 +365,9 @@ def make_plan(body):
             if any(directory.is_relative_to(root) for root in roots):
                 bins.append(directory.relative_to(home).as_posix())
     plan['tool_runtime'] = {'bin_dirs': list(dict.fromkeys(bins)), 'target_existing_settings_preferred': True}
+    node_bin = user_node_bin(home, roots)
+    if node_bin and node_bin not in plan['tool_runtime']['bin_dirs']:
+        plan['tool_runtime']['bin_dirs'].append(node_bin)
     include_active_files(plan)
     if body.get('include_atlas', True):
         plan['atlas'] = {'catalog': db.DATA.relative_to(home).as_posix(),
@@ -750,7 +807,7 @@ def reports(ident):
                 if p.name in {'verification.json', 'activation.json', 'native-acceptance.json',
                               'atlas-deployment.json', 'workspace-acceptance.json', 'completion.json',
                               'attachment-recovery.json', 'attachment-recovery-progress.json',
-                              'tool-verification.json', 'tool-installation.json'}}
+                              'tool-verification.json', 'tool-installation.json', 'python-runtime-rebinding.json', 'python-runtime-acceptance.json', 'rollout-path-rebinding.json'}}
     return remote(plan, 'report')
 
 
@@ -760,10 +817,10 @@ def install_tools(ident, supplement_id):
         raise ValueError('请先接入目标 Codex')
     if supplement.get('parent_migration') != ident or supplement.get('verification', {}).get('status') != 'passed':
         raise ValueError('补充任务不属于本次迁移或未通过文件校验')
-    node = shutil.which('node')
-    if not node or not Path(node).is_relative_to(plan['source_home']):
+    node_bin = supplement.get('source_node_bin') or user_node_bin(plan['source_home'], [r['source'] for r in supplement['roots']])
+    if not node_bin:
         raise ValueError('无法确定来源用户 Node 运行版本')
-    node_bin = Path(node).parent.relative_to(plan['source_home']).as_posix()
+    save(supplement, source_node_bin=node_bin)
     candidates = [('node', node_bin + '/node', ['--version'])] + [
         (name, '.local/bin/' + name, ['version'] if name == 'hf' else ['--version'])
         for name in ['uv', 'uvx', 'lark-cli', 'hf', 'claude']]
@@ -771,7 +828,8 @@ def install_tools(ident, supplement_id):
               if (Path(plan['source_home']) / relative).is_file()]
     entry = str(Path(plan['atlas']['catalog']).parent / 'tools/migration-env.sh') if plan.get('atlas') else '.config/atlas/migration-env.sh'
     report = remote(plan, 'install_tools', timeout=1800, supplement_root=supplement['root'], supplement_id=supplement_id,
-        tool_roots=[r['relative'] for r in supplement['roots']], node_bin=node_bin, probes=probes, environment_entry=entry)
+        tool_roots=[r['relative'] for r in supplement['roots']], node_bin=node_bin, probes=probes, environment_entry=entry,
+        verify_only=bool(supplement.get('tool_installation')))
     agent.atomic_json(folder(ident) / 'tool-installation.json', report)
     save(plan, tool_supplement={'id': supplement_id, 'status': report['status'],
          'entries': supplement['verification']['entries'], 'bytes': supplement['verification']['bytes']})
@@ -779,11 +837,36 @@ def install_tools(ident, supplement_id):
     return report
 
 
+def repair_paths(ident):
+    plan = read(ident)
+    if plan['status'] not in {'activated_pending_acceptance', 'native_verified'}:
+        raise ValueError('请先接入目标环境')
+    report = remote(plan, 'repair_active_paths', timeout=1800, allow_app_restart=True)
+    agent.atomic_json(folder(ident) / 'rollout-path-rebinding.json', report)
+    save(plan, status='activated_pending_acceptance', rollout_paths=report,
+         native_acceptance=None, workspace_acceptance=None, detail='日志与数据库路径已重绑定，等待重新验收')
+    return report
+
+
+def repair_runtimes(ident):
+    plan = read(ident)
+    if plan['status'] != 'activation_prepared':
+        raise ValueError('请先准备接续副本')
+    report = remote(plan, 'repair_runtimes', timeout=600)
+    plan['activation']['python_runtimes'] = report
+    save(plan)
+    return report
+
+
 def verify_workspaces(ident):
     plan = read(ident)
     if plan['status'] not in {'activated_pending_acceptance', 'native_verified', 'complete'}:
         raise ValueError('请先接入目标环境')
-    report = remote(plan, 'verify_workspaces', timeout=7200)
+    if 'source_missing_transient_workspaces' not in plan:
+        plan['source_missing_transient_workspaces'] = missing_transient_workspaces(plan['source_home'])
+        save(plan)
+    report = remote(plan, 'verify_workspaces', timeout=7200,
+                    source_missing_transient_workspaces=plan['source_missing_transient_workspaces'])
     agent.atomic_json(folder(ident) / 'workspace-acceptance.json', report)
     save(plan, workspace_acceptance=report)
     return report
@@ -818,7 +901,7 @@ def complete(ident):
 def main():
     import argparse
     parser = argparse.ArgumentParser(description='Atlas Codex 迁移')
-    parser.add_argument('action', choices=['plan', 'start', 'worker', 'status', 'prepare-profile', 'activate', 'verify-native', 'deploy-atlas', 'verify-workspaces', 'install-tools', 'complete'])
+    parser.add_argument('action', choices=['plan', 'start', 'worker', 'status', 'prepare-profile', 'activate', 'verify-native', 'deploy-atlas', 'verify-workspaces', 'repair-runtimes', 'repair-paths', 'install-tools', 'complete'])
     parser.add_argument('value', nargs='?')
     parser.add_argument('--supplement')
     args = parser.parse_args()
@@ -836,6 +919,10 @@ def main():
         if not args.supplement:
             parser.error('install-tools requires --supplement TASK_ID')
         print(json.dumps(install_tools(args.value, args.supplement), ensure_ascii=False))
+    elif args.action == 'repair-paths':
+        print(json.dumps(repair_paths(args.value), ensure_ascii=False))
+    elif args.action == 'repair-runtimes':
+        print(json.dumps(repair_runtimes(args.value), ensure_ascii=False))
     elif args.action == 'complete':
         print(json.dumps(complete(args.value),ensure_ascii=False))
     elif args.action == 'plan':

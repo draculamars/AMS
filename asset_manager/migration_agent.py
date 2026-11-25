@@ -320,6 +320,7 @@ def verify(body):
 def prepare_activation(body):
     import atlas_codex_profile as profile
     import atlas_codex_attachments as attachments
+    import atlas_migration_tools as runtime_tools
     root = checked_root(body['root'])
     validate_staging_root(root, Path.home(), body.get('roots', []), resolve_paths=True)
     receipt = json.loads((root / 'evidence/verification.json').read_text())
@@ -460,6 +461,10 @@ def prepare_activation(body):
     atomic_json(working / global_name, profile.merge_global_state(source_global, target_global, source_home, target_home))
     profile.clone(working / global_name, working / (global_name + '.atlas-merged'))
     repairs = profile.repair_references([working], source_home, target_home)
+    rollout_paths = profile.repair_rollout_metadata(working, source_home, target_home)
+    atomic_json(root / 'evidence/rollout-path-rebinding.json', rollout_paths)
+    if rollout_paths['status'] != 'prepared':
+        raise ValueError('日志路径重绑定存在需核对的记录，原始快照仍保留')
     prepared_roots, retained_runtime = [], []
     for row in body.get('roots', []):
         relative = Path(row['relative'])
@@ -477,6 +482,7 @@ def prepare_activation(body):
         profile.clone(root / 'incoming' / relative, staged)
         prepared_roots.append(staged)
     project_repairs = profile.repair_references(prepared_roots, source_home, target_home)
+    python_runtimes = runtime_tools.repair_python_links(root, Path.home(), sys.modules[__name__], profile)
     dependencies = []
     with profile.connection(working / 'state_5.sqlite') as c:
         for row in c.execute('SELECT DISTINCT cwd FROM threads'):
@@ -490,6 +496,7 @@ def prepare_activation(body):
               'source_automations': 'archived_inactive_to_avoid_duplicate_execution',
               'references': repairs, 'dependencies': dependencies,
               'project_references': project_repairs, 'retained_destination_runtime': retained_runtime,
+              'python_runtimes': python_runtimes,
               'prepared_roots': [str(p.relative_to(root / 'prepared/home')) for p in prepared_roots],
               'manifest_sha256': receipt['manifest_sha256'],
               'prepared_at': time.time(), 'original_target_untouched': True,
@@ -505,6 +512,9 @@ def activate(body):
     report = json.loads((root / 'evidence/activation.json').read_text())
     if report['status'] != 'prepared':
         raise ValueError('尚未准备可接续环境')
+    runtimes = root / 'evidence/python-runtime-rebinding.json'
+    if runtimes.exists() and json.loads(runtimes.read_text())['status'] != 'prepared':
+        raise ValueError('Python 运行环境仍有未解决的解释器依赖')
     if report.get('manifest_sha256') != digest(root / 'evidence/source-manifest.jsonl'):
         raise ValueError('来源快照已更新，请重新准备接续环境')
     if not body.get('allow_app_restart'):
@@ -629,8 +639,60 @@ def activate(body):
             subprocess.run(['open', '-a', name], capture_output=True, timeout=20)
 
 
+def repair_active_paths(body):
+    """Maintenance for an already activated profile, with a preserved rollback."""
+    import atlas_codex_profile as profile
+    root = checked_root(body['root'])
+    activation = json.loads((root / 'evidence/activation.json').read_text())
+    if activation['status'] not in {'activated_pending_acceptance', 'accepted'} or not body.get('allow_app_restart'):
+        raise ValueError('路径维护需要已激活的迁移与目标重启授权')
+    if sys.platform != 'darwin':
+        raise ValueError('当前自动退出与重启仅支持 macOS')
+    current = Path.home() / '.codex'
+    with profile.connection(current / 'thread_history_1.sqlite') as c:
+        if c.execute("SELECT count(*) FROM thread_turns WHERE status NOT IN ('completed','interrupted','failed') AND completed_at IS NULL").fetchone()[0]:
+            raise ValueError('目标仍有活动会话，暂不修改')
+    reopened = []
+    try:
+        processes = run(['ps', '-axo', 'comm='])
+        for name in ['ChatGPT', 'Codex']:
+            if '/Applications/' + name + '.app/Contents/MacOS/' in processes:
+                result = subprocess.run(['osascript', '-e', 'tell application "' + name + '" to quit'], capture_output=True, timeout=30)
+                if result.returncode:
+                    raise ValueError('目标应用未正常退出')
+                reopened.append(name)
+            cli = Path('/Applications') / (name + '.app/Contents/Resources/codex-cli/bin/codex')
+            if cli.is_file():
+                subprocess.run([str(cli), 'app-server', 'daemon', 'stop'], capture_output=True, timeout=30)
+        for _ in range(30):
+            processes = run(['ps', '-axo', 'comm='])
+            if not any('/Applications/' + name + '.app/' in line and ('/codex' in line or line.endswith('/MacOS/' + name))
+                       for line in processes.splitlines() for name in ['ChatGPT', 'Codex']):
+                break
+            time.sleep(1)
+        else:
+            raise ValueError('目标仍有 Codex 写入进程')
+        preserved = root / 'path-repair-history' / uuid.uuid4().hex
+        preserved.mkdir(parents=True)
+        profile.backup(current / 'state_5.sqlite', preserved / 'state_5.sqlite')
+        for name in ['sessions', 'archived_sessions']:
+            if (current / name).exists():
+                profile.clone(current / name, preserved / name)
+        source_home = json.loads((root / 'ATLAS-MIGRATION.json').read_text())['source_home']
+        result = profile.repair_rollout_metadata(current, source_home, str(Path.home()))
+        result['previous_profile_paths'] = str(preserved)
+        atomic_json(root / 'evidence/rollout-path-rebinding.json', result)
+        activation.update(status='activated_pending_acceptance', rollout_paths=result)
+        atomic_json(root / 'evidence/activation.json', activation)
+        return result
+    finally:
+        for name in reopened:
+            subprocess.run(['open', '-a', name], capture_output=True, timeout=20)
+
+
 def accept_native(body):
     import atlas_codex_profile as profile
+    import atlas_migration_tools as runtime_tools
     root = checked_root(body['root'])
     activation = json.loads((root / 'evidence/activation.json').read_text())
     if activation['status'] not in {'activated_pending_acceptance', 'accepted'}:
@@ -642,6 +704,10 @@ def accept_native(body):
             return [r[0] for r in c.execute('SELECT id FROM threads')]
     result = profile.native_acceptance(Path.home() / '.codex', root / 'evidence',
         ids(root / 'incoming/.codex/state_5.sqlite'), ids(root / 'destination-original-codex/state_5.sqlite'))
+    if (root / 'evidence/python-runtime-rebinding.json').exists():
+        result['python_runtimes'] = runtime_tools.verify_python_links(root, Path.home(), sys.modules[__name__])
+        if result['python_runtimes']['status'] != 'passed':
+            result['status'] = 'failed'
     recovered = root / 'evidence/attachment-recovery.json'
     if recovered.exists():
         recovery = json.loads(recovered.read_text())
@@ -770,6 +836,8 @@ def main():
         result = activate(body)
     elif action == 'accept_native':
         result = accept_native(body)
+    elif action == 'repair_active_paths':
+        result = repair_active_paths(body)
     elif action == 'probe_native':
         import atlas_codex_profile as profile
         root = checked_root(body['root'])
@@ -802,6 +870,16 @@ def main():
                                        'roots': body['tool_roots']}, sys.modules[__name__], profile)
         atomic_json(root / 'evidence/tool-verification.json', json.loads((supplement / 'evidence/verification.json').read_text()))
         atomic_json(root / 'evidence/tool-installation.json', result)
+    elif action == 'repair_runtimes':
+        import atlas_codex_profile as profile
+        import atlas_migration_tools as runtime_tools
+        root = checked_root(body['root'])
+        activation = json.loads((root / 'evidence/activation.json').read_text())
+        if activation['status'] != 'prepared':
+            raise ValueError('运行环境重绑定只能在准备副本中执行')
+        result = runtime_tools.repair_python_links(root, Path.home(), sys.modules[__name__], profile)
+        activation['python_runtimes'] = result
+        atomic_json(root / 'evidence/activation.json', activation)
     elif action == 'verify_workspaces':
         import atlas_codex_profile as profile
         root = checked_root(body['root'])
@@ -809,7 +887,7 @@ def main():
         if activation['status'] not in {'activated_pending_acceptance', 'accepted'}:
             raise ValueError('请先接入目标环境')
         source_home = json.loads((root / 'ATLAS-MIGRATION.json').read_text())['source_home']
-        result = profile.workspace_acceptance(root, source_home, str(Path.home()))
+        result = profile.workspace_acceptance(root, source_home, str(Path.home()), body.get('source_missing_transient_workspaces', []))
         atomic_json(root / 'evidence/workspace-acceptance.json', result)
     elif action == 'recover_worktree':
         import atlas_codex_profile as profile
@@ -852,7 +930,7 @@ def main():
     elif action == 'report':
         root = checked_root(body['root'])
         result = {}
-        for name in ['verification-progress.json', 'verification.json', 'activation.json', 'native-acceptance.json', 'atlas-deployment.json', 'workspace-acceptance.json', 'completion.json', 'attachment-recovery-progress.json', 'attachment-recovery.json', 'tool-verification.json', 'tool-installation.json']:
+        for name in ['verification-progress.json', 'verification.json', 'activation.json', 'native-acceptance.json', 'atlas-deployment.json', 'workspace-acceptance.json', 'completion.json', 'attachment-recovery-progress.json', 'attachment-recovery.json', 'tool-verification.json', 'tool-installation.json', 'python-runtime-rebinding.json', 'python-runtime-acceptance.json', 'rollout-path-rebinding.json']:
             p = root / 'evidence' / name
             if p.is_file():
                 result[name] = json.loads(p.read_text())

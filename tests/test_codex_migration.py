@@ -49,6 +49,37 @@ def test_runtime_discovery_follows_user_launcher_package_without_login_profiles(
     assert login not in roots and tmp_path not in roots
 
 
+def test_service_node_selection_uses_captured_nvm_default(tmp_path, monkeypatch):
+    monkeypatch.setattr(migration.shutil, 'which', lambda _: '/outside/node')
+    for version in ['v20.20.0', 'v26.8.2']:
+        executable = tmp_path / '.nvm/versions/node' / version / 'bin/node'
+        executable.parent.mkdir(parents=True); executable.write_text('fixture')
+    alias = tmp_path / '.nvm/alias/default'; alias.parent.mkdir(); alias.write_text('20\n')
+    assert migration.user_node_bin(tmp_path, [tmp_path / '.nvm']) == '.nvm/versions/node/v20.20.0/bin'
+    assert migration.user_node_bin(tmp_path, []) is None
+
+
+def test_expired_temporary_cwd_is_recorded_without_ignoring_project_gaps(tmp_path, monkeypatch):
+    home = tmp_path / 'home'; (home / '.codex').mkdir(parents=True)
+    scratch = tmp_path / 'scratch'; scratch.mkdir()
+    monkeypatch.setattr(migration.tempfile, 'gettempdir', lambda: str(scratch))
+    with sqlite3.connect(home / '.codex/state_5.sqlite') as c:
+        c.execute('CREATE TABLE threads(id TEXT,cwd TEXT,project_id TEXT)')
+        c.executemany('INSERT INTO threads VALUES(?,?,?)', [('temporary', str(scratch / 'expired'), None),
+            ('registered', str(scratch / 'project'), 'project'), ('missing', str(home / 'missing'), None)])
+    records = migration.missing_transient_workspaces(home)
+    assert [r['id'] for r in records] == ['temporary']
+    root = tmp_path / 'snapshot'; (root / 'evidence').mkdir(parents=True)
+    (root / 'evidence/source-manifest.jsonl').write_text('')
+    with sqlite3.connect(home / '.codex/state_5.sqlite') as c:
+        c.execute('ALTER TABLE threads ADD COLUMN git_sha TEXT')
+        c.execute('CREATE TABLE project_roots(path TEXT)')
+    result = profile.workspace_acceptance(root, '/source', str(home), records)
+    assert result['status'] == 'needs_attention'
+    assert {r['id'] for r in result['missing_thread_workspaces']} == {'registered', 'missing'}
+    assert result['source_missing_transient_workspaces'][0]['id'] == 'temporary'
+
+
 def test_tool_supplement_preserves_configuration_and_refuses_repeat(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, 'home', lambda: tmp_path)
     root = tmp_path / 'MigrationInbox/tools'
@@ -56,7 +87,7 @@ def test_tool_supplement_preserves_configuration_and_refuses_repeat(tmp_path, mo
     executable = root / 'incoming/tools/bin/node'
     executable.parent.mkdir(parents=True)
     executable.write_text('#!/bin/sh\nprintf "fixture-version\\n"\n'); executable.chmod(0o755)
-    manifest = root / 'evidence/source-manifest.jsonl'; manifest.write_text('fixture\n')
+    manifest = root / 'evidence/source-manifest.jsonl'; manifest.write_text(json.dumps({'path': 'tools/bin/node', 'type': 'file'}) + '\n')
     agent.atomic_json(root / 'evidence/verification.json', {'status': 'passed', 'manifest_sha256': agent.digest(manifest)})
     config = tmp_path / '.codex/config.toml'; config.parent.mkdir()
     original = '[shell_environment_policy.set]\nPATH="/custom/bin"\n[mcp_servers.keep]\ncommand="/keep"\n'
@@ -83,26 +114,71 @@ def test_tool_supplement_rejects_unverified_content_before_writing(tmp_path, mon
     assert not (tmp_path / 'tools').exists()
 
 
-@pytest.mark.parametrize('empty', ['', 'turns', 'items', 'skills', 'resume'])
+def test_readonly_prepared_git_reference_is_repaired_with_mode_retained(tmp_path):
+    import stat
+    path = tmp_path / 'project/.git/objects/info/alternates'
+    path.parent.mkdir(parents=True)
+    path.write_text('/old/project/.git/objects\n'); path.chmod(0o444)
+    report = profile.repair_references([tmp_path], '/old', '/new')
+    assert path.read_text() == '/new/project/.git/objects\n'
+    assert stat.S_IMODE(path.stat().st_mode) == 0o444
+    assert report['changed'][0]['kind'] == 'git_alternates'
+
+
+@pytest.mark.parametrize('required', ['3.14.3', '3.14.4'])
+def test_python_rebinding_requires_exact_version_and_keeps_retry_evidence(tmp_path, monkeypatch, required):
+    import platform
+    root = tmp_path / 'migration'; home = tmp_path / 'target'; home.mkdir()
+    runtime = Path('project/.runtime/python/bin/python3.14')
+    link = Path('project/.venv/bin/python3.14')
+    staged_runtime = root / 'prepared/home' / runtime
+    staged_runtime.parent.mkdir(parents=True)
+    staged_runtime.write_bytes(b'\xcf\xfa\xed\xfe' + b'fixture')
+    staged_link = root / 'prepared/home' / link; staged_link.parent.mkdir(parents=True)
+    staged_link.symlink_to('/missing/source-python/bin/python3.14')
+    config = staged_link.parent.parent / 'pyvenv.cfg'
+    config.write_text('home = /missing/source-python/bin\nversion = ' + required + '\n'); config.chmod(0o444)
+    manifest = root / 'evidence/source-manifest.jsonl'; manifest.parent.mkdir()
+    manifest.write_text(json.dumps({'path': str(runtime), 'type': 'file'}) + '\n' + json.dumps({'path': str(link), 'type': 'symlink'}) + '\n')
+    def identity(path):
+        path = Path(path)
+        return {'version': [3,14,3] if '.runtime' in path.parts else [3,9,6], 'executable': str(path),
+                'base_prefix': str(path.parent.parent), 'prefix': str(path.parent.parent),
+                'architecture': platform.machine(), 'soabi': 'cpython-314-darwin', 'free_threaded': False}
+    monkeypatch.setattr(migration_tools, 'python_identity', identity)
+    report = migration_tools.repair_python_links(root, home, agent, profile)
+    if required == '3.14.4':
+        assert report['status'] == 'needs_attention' and not report['changes']
+        assert os.readlink(staged_link) == '/missing/source-python/bin/python3.14'
+    else:
+        assert report['status'] == 'prepared' and os.readlink(staged_link) == str(home / runtime)
+        assert len(migration_tools.repair_python_links(root, home, agent, profile)['changes']) == 1
+        assert str(home / runtime.parent) in config.read_text()
+    assert config.stat().st_mode & 0o777 == 0o444
+
+
+@pytest.mark.parametrize('empty', ['', 'turns', 'items', 'skills', 'resume', 'read', 'list'])
 def test_native_acceptance_requires_actual_history_and_resume(tmp_path, monkeypatch, empty):
     codex = tmp_path / '.codex'; codex.mkdir()
     cwd = tmp_path / 'project'; cwd.mkdir()
     cli = tmp_path / 'codex-cli'; cli.write_text('fixture')
     monkeypatch.setattr(profile.shutil, 'which', lambda _: str(cli))
     with sqlite3.connect(codex / 'state_5.sqlite') as c:
-        c.execute('CREATE TABLE threads(id TEXT,attached_thread_parent_id TEXT)')
-        c.execute("INSERT INTO threads VALUES('one',NULL)")
+        c.execute('CREATE TABLE threads(id TEXT,attached_thread_parent_id TEXT,source TEXT)')
+        c.execute('INSERT INTO threads VALUES(?,NULL,?)', ('one', json.dumps({'subagent': {'thread_spawn': {'parent_thread_id': 'parent'}}})))
     with sqlite3.connect(codex / 'thread_history_1.sqlite') as c:
         c.execute('CREATE TABLE thread_turns(thread_id TEXT)')
         c.execute("INSERT INTO thread_turns VALUES('one')")
+        c.execute("INSERT INTO thread_turns VALUES('deleted-source-thread')")
         c.execute('CREATE TABLE thread_items(thread_id TEXT)')
         c.execute("INSERT INTO thread_items VALUES('one')")
     class Client:
         def __init__(self, *args): pass
         def close(self): pass
         def request(self, method, params, **kw):
-            if method == 'thread/list': return {'data': [{'id': 'one'}]}
-            if method == 'thread/read': return {'thread': {'id': 'one', 'cwd': str(cwd)}}
+            if method == 'thread/list': return {'data': [{'id': 'one'}] if params.get('parentThreadId') == 'parent' and empty != 'list' else []}
+            if method == 'thread/read': return {'thread': {'id': 'wrong' if empty == 'read' else 'one', 'cwd': str(cwd)}}
+            assert params.get('threadId') != 'deleted-source-thread'
             if method == 'thread/turns/list': return {'data': [] if empty == 'turns' else [{'id': 'turn'}]}
             if method == 'thread/items/list': return {'data': [] if empty == 'items' else [{'type': 'userMessage'}]}
             if method == 'thread/resume': return {'thread': {'id': 'wrong' if empty == 'resume' else 'one'}, 'cwd': str(cwd)}
@@ -112,6 +188,8 @@ def test_native_acceptance_requires_actual_history_and_resume(tmp_path, monkeypa
     result = profile.native_acceptance(codex, tmp_path, ['one'], [])
     assert result['status'] == ('failed' if empty else 'passed')
     assert result['model_turns_started'] is False
+    assert result['unregistered_history_ids'] == ['deleted-source-thread']
+    assert result['parent_groups_checked'] == 1
 
 
 def test_sqlite_snapshot_includes_wal_and_preserves_source(tmp_path):
@@ -130,6 +208,30 @@ def test_sqlite_snapshot_includes_wal_and_preserves_source(tmp_path):
     assert info['sha256'] == agent.digest(target)
     assert c.execute('SELECT count(*) FROM messages').fetchone()[0] == 2
     c.close()
+
+
+def test_rollout_rebinding_survives_index_rebuild_without_rewriting_messages(tmp_path):
+    codex = tmp_path / '.codex'; logs = codex / 'sessions'; logs.mkdir(parents=True)
+    path = logs / 'rollout.jsonl'
+    original = b'{"type":"response_item","payload":{"text":"/old/user/project","cwd":"/old/user/project"}}\n'
+    huge = b'{"type":"response_item","payload":"' + b'x' * 1024 + b'"}\n'
+    metadata = {'type': 'session_meta', 'payload': {'cwd': '/old/user/project', 'instructions': '/old/user/keep-prose'}}
+    context = {'type': 'turn_context', 'payload': {'cwd': '/old/user/project'}}
+    path.write_bytes(json.dumps(metadata).encode()+b'\n'+original+huge+json.dumps(context).encode()+b'\n')
+    path.chmod(0o444)
+    with sqlite3.connect(codex / 'state_5.sqlite') as c:
+        c.execute('CREATE TABLE threads(id TEXT,cwd TEXT,rollout_path TEXT)')
+        c.execute('INSERT INTO threads VALUES(?,?,?)', ('one','/old/user/project','/old/user/.codex/sessions/rollout.jsonl'))
+    result = profile.repair_rollout_metadata(codex, '/old/user', '/new/user', max_record_bytes=256)
+    content = path.read_bytes(); lines = content.splitlines()
+    assert json.loads(lines[0])['payload'] == {'cwd':'/new/user/project','instructions':'/old/user/keep-prose'}
+    assert json.loads(lines[-1])['payload']['cwd'] == '/new/user/project'
+    assert original in content and huge in content
+    assert result['state_rows'] == 1 and result['files'][0]['records'] == 2
+    assert result['warnings'][0]['reason'] == 'record_size_limit'
+    assert path.stat().st_mode & 0o777 == 0o444
+    with sqlite3.connect(codex / 'state_5.sqlite') as c:
+        assert c.execute('SELECT cwd FROM threads').fetchone()[0] == '/new/user/project'
 
 
 def test_agent_refuses_existing_nonempty_and_wrong_job(tmp_path, monkeypatch):

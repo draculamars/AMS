@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import selectors
@@ -257,6 +258,94 @@ def clone(source, target):
         shutil.copy2(source, target, follow_symlinks=False)
 
 
+@contextlib.contextmanager
+def writable_copy(path):
+    """Temporarily edit a prepared file/directory, restoring its original mode."""
+    path = Path(path)
+    if path.is_symlink():
+        raise ValueError('不能通过软链接修改副本权限')
+    mode = stat.S_IMODE(path.stat().st_mode)
+    path.chmod(mode | stat.S_IWUSR)
+    try:
+        yield
+    finally:
+        path.chmod(mode)
+
+
+def write_copy(path, content):
+    with writable_copy(path):
+        if isinstance(content, bytes):
+            path.write_bytes(content)
+        else:
+            path.write_text(content)
+
+
+def repair_rollout_metadata(codex_home, source_home, target_home, max_record_bytes=128 * 1024**2):
+    """Rebind typed session metadata in a derived profile, preserving prose bytes.
+
+    Codex can rebuild SQLite cwd from JSONL metadata on startup. Both stores must
+    agree. Large non-metadata records are copied in bounded chunks, never loaded
+    as a complete rollout. Invalid records remain byte-identical and are reported.
+    """
+    import re
+    codex_home = Path(codex_home)
+    changed, warnings = [], []
+    for directory in ['sessions', 'archived_sessions']:
+        for path in sorted((codex_home / directory).rglob('*.jsonl')):
+            if path.is_symlink() or not path.resolve().is_relative_to(codex_home.resolve()):
+                raise ValueError('会话日志链接越界')
+            temporary = path.with_name(path.name + '.atlas-paths.tmp')
+            if temporary.exists():
+                raise ValueError('已有未完成的日志重绑定副本：' + str(temporary))
+            count, line_number = 0, 0
+            try:
+                with path.open('rb') as src, temporary.open('xb') as dst:
+                    temporary.chmod(0o600)
+                    while True:
+                        raw = src.readline(max_record_bytes + 1)
+                        if not raw:
+                            break
+                        line_number += 1
+                        if len(raw) > max_record_bytes:
+                            warnings.append({'path': str(path), 'line': line_number, 'reason': 'record_size_limit'})
+                            dst.write(raw)
+                            while not raw.endswith(b'\n'):
+                                raw = src.readline(1024**2)
+                                if not raw:
+                                    break
+                                dst.write(raw)
+                            continue
+                        # Only the top-level discriminator near the start is
+                        # eligible. Message/tool bodies are never rewritten.
+                        if re.search(rb'"type"\s*:\s*"(?:session_meta|turn_context)"', raw[:256]):
+                            try:
+                                record = json.loads(raw)
+                                if record.get('type') in {'session_meta', 'turn_context'}:
+                                    mapped = map_json_paths(record.get('payload'), source_home, target_home)
+                                    if mapped != record.get('payload'):
+                                        record['payload'] = mapped
+                                        raw = json.dumps(record, ensure_ascii=False, separators=(',', ':')).encode() + (b'\n' if raw.endswith(b'\n') else b'')
+                                        count += 1
+                            except (ValueError, UnicodeError):
+                                warnings.append({'path': str(path), 'line': line_number, 'reason': 'invalid_metadata_json'})
+                        dst.write(raw)
+                if count:
+                    shutil.copystat(path, temporary)
+                    with writable_copy(path.parent):
+                        os.replace(temporary, path)
+                    changed.append({'path': str(path), 'records': count})
+            finally:
+                temporary.unlink(missing_ok=True)
+    with sqlite3.connect(codex_home / 'state_5.sqlite') as c:
+        rows = c.execute('SELECT id,cwd,rollout_path FROM threads').fetchall()
+        mapped_rows = [(map_path(cwd, source_home, target_home), map_path(rollout, source_home, target_home), ident)
+                      for ident, cwd, rollout in rows if map_path(cwd, source_home, target_home) != cwd or map_path(rollout, source_home, target_home) != rollout]
+        c.executemany('UPDATE threads SET cwd=?,rollout_path=? WHERE id=?', mapped_rows)
+    return {'status': 'prepared' if not warnings else 'needs_attention', 'files': changed,
+            'state_rows': len(mapped_rows), 'warnings': warnings, 'historical_message_bytes_preserved': True,
+            'scope': 'session_meta_turn_context_and_state_paths', 'checked_at': time.time()}
+
+
 def repair_references(roots, source_home, target_home):
     """Change only filesystem references, not code, historical prose or user data."""
     changed, external = [], []
@@ -269,7 +358,8 @@ def repair_references(roots, source_home, target_home):
                     before = os.readlink(path)
                     after = map_path(before, source_home, target_home)
                     if before != after:
-                        path.unlink(); path.symlink_to(after)
+                        with writable_copy(path.parent):
+                            path.unlink(); path.symlink_to(after)
                         changed.append({'path': str(path), 'kind': 'symlink', 'before': before, 'after': after})
                     elif os.path.isabs(before) and not path.exists():
                         external.append({'path': str(path), 'target': before})
@@ -285,7 +375,7 @@ def repair_references(roots, source_home, target_home):
                         lines.append(key + separator + value)
                     after = ''.join(lines)
                     if before != after:
-                        path.write_text(after)
+                        write_copy(path, after)
                         changed.append({'path': str(path), 'kind': 'python_environment'})
                 elif path.is_file() and path.parent.name == 'bin' and (path.parent.parent / 'pyvenv.cfg').is_file():
                     with path.open('rb') as f:
@@ -294,13 +384,13 @@ def repair_references(roots, source_home, target_home):
                     if first.startswith(prefix):
                         after = ('#!' + target_home).encode() + first[len(('#!' + source_home).encode()):]
                         content = path.read_bytes()
-                        path.write_bytes(after + content[len(first):])
+                        write_copy(path, after + content[len(first):])
                         changed.append({'path': str(path), 'kind': 'python_entrypoint'})
                 elif path.is_file() and path.suffix == '.pth' and path.parent.name == 'site-packages':
                     before = path.read_text()
                     after = ''.join(map_path(line, source_home, target_home) for line in before.splitlines(keepends=True))
                     if before != after:
-                        path.write_text(after)
+                        write_copy(path, after)
                         changed.append({'path': str(path), 'kind': 'python_search_path'})
                 elif path.is_file() and (name == '.git' or (name in {'gitdir', 'commondir'} and '.git' in path.parts)):
                     before = path.read_text()
@@ -308,7 +398,7 @@ def repair_references(roots, source_home, target_home):
                     raw = before[len(prefix):].strip()
                     after = map_path(raw, source_home, target_home)
                     if raw != after:
-                        path.write_text(prefix + after + '\n')
+                        write_copy(path, prefix + after + '\n')
                         changed.append({'path': str(path), 'kind': 'git_pointer', 'before': raw, 'after': after})
                 elif path.is_file() and name in {'config', 'config.worktree'} and '.git' in path.parts:
                     for key in ['core.worktree', 'include.path']:
@@ -317,13 +407,14 @@ def repair_references(roots, source_home, target_home):
                             before = found.stdout.decode().strip()
                             after = map_path(before, source_home, target_home)
                             if before != after:
-                                subprocess.run(['git', 'config', '--file', str(path), key, after], check=True, capture_output=True)
+                                with writable_copy(path.parent), writable_copy(path):
+                                    subprocess.run(['git', 'config', '--file', str(path), key, after], check=True, capture_output=True)
                                 changed.append({'path': str(path), 'kind': key, 'before': before, 'after': after})
                 elif path.is_file() and name == 'alternates' and '.git' in path.parts:
                     before = path.read_text()
                     after = '\n'.join(map_path(line, source_home, target_home) for line in before.splitlines()) + '\n'
                     if before != after:
-                        path.write_text(after)
+                        write_copy(path, after)
                         changed.append({'path': str(path), 'kind': 'git_alternates'})
     return {'changed': changed, 'external_broken_links': external}
 
@@ -425,10 +516,26 @@ def native_acceptance(codex_home, evidence, source_ids, destination_ids):
     client = NativeCodex(executable, codex_home, evidence / 'native-validation.log')
     try:
         listed = {}
-        for archived in [False, True]:
+        expected = set(source_ids) | set(destination_ids)
+        with connection(codex_home / 'state_5.sqlite') as c:
+            rows = [dict(r) for r in c.execute('SELECT * FROM threads')]
+        attached = {r['id'] for r in rows if r.get('attached_thread_parent_id')}
+        parents = set()
+        for row in rows:
+            try:
+                source = json.loads(row.get('source', ''))
+                parent = source.get('subagent', {}).get('thread_spawn', {}).get('parent_thread_id')
+                if parent:
+                    parents.add(parent)
+            except (ValueError, AttributeError):
+                pass
+        filters = [{}] + [{'parentThreadId': p} for p in sorted(parents)]
+        filters += [{'attachedToThreadId': p} for p in sorted({r['attached_thread_parent_id'] for r in rows if r.get('attached_thread_parent_id')})]
+        for scope, archived in ((scope, archived) for scope in filters for archived in [False, True]):
             cursor = None
             while True:
                 result = client.request('thread/list', {'limit': 100, 'archived': archived, 'cursor': cursor,
+                    **scope,
                     'currentAccountOnly': False, 'useStateDbOnly': True,
                     'sourceKinds': ['cli', 'vscode', 'exec', 'appServer', 'subAgent', 'subAgentReview',
                                     'subAgentCompact', 'subAgentThreadSpawn', 'subAgentOther', 'unknown']})
@@ -437,23 +544,26 @@ def native_acceptance(codex_home, evidence, source_ids, destination_ids):
                 cursor = result.get('nextCursor')
                 if not cursor:
                     break
-        expected = set(source_ids) | set(destination_ids)
-        with connection(codex_home / 'state_5.sqlite') as c:
-            attached = {r[0] for r in c.execute('SELECT id FROM threads WHERE attached_thread_parent_id IS NOT NULL')}
-        # Attached chats live under their parent and intentionally do not appear
-        # in the top-level listing. They must still pass direct native reads.
-        missing = sorted(expected - listed.keys() - attached)
+        # Spawned and attached chats are queried under their actual parents.
+        missing = sorted(expected - listed.keys())
         errors, checked = [], []
         for ident in sorted(expected):
             try:
                 result = client.request('thread/read', {'threadId': ident, 'includeTurns': False})
                 thread = result['thread']
+                if thread.get('id') != ident:
+                    raise ValueError('原生读取返回的会话标识与请求不符')
                 checked.append({'id': ident, 'cwd': thread.get('cwd'), 'history_mode': thread.get('historyMode')})
             except ValueError as exc:
                 errors.append({'id': ident, 'error': str(exc)})
         history_samples = []
         with connection(codex_home / 'thread_history_1.sqlite') as c:
-            samples = [r[0] for r in c.execute('SELECT thread_id FROM thread_turns GROUP BY thread_id ORDER BY count(*) DESC')]
+            history_ids = [r[0] for r in c.execute('SELECT thread_id FROM thread_turns GROUP BY thread_id ORDER BY count(*) DESC')]
+            samples = [ident for ident in history_ids if ident in expected]
+            # Older deleted/unregistered chats can retain history rows without
+            # an active state index. Preserve these rows; do not invent chats or
+            # claim that the native app can open them.
+            orphan_history = sorted(set(history_ids) - expected)
             item_counts = dict(c.execute('SELECT thread_id,count(*) FROM thread_items GROUP BY thread_id'))
         for ident in samples:
             try:
@@ -494,6 +604,8 @@ def native_acceptance(codex_home, evidence, source_ids, destination_ids):
                 'source_threads': len(source_ids), 'preserved_target_threads': len(destination_ids),
                 'listed_threads': len(listed), 'read_threads': len(checked), 'missing_ids': missing,
                 'attached_threads': len(expected & attached),
+                'parent_groups_checked': len(filters) - 1,
+                'unregistered_history_ids': orphan_history,
                 'errors': errors, 'threads': checked, 'history_samples': history_samples,
                 'resume': resume_test, 'skills': skills,
                 'scope': 'native_thread_list_read_history_resume_and_skills', 'checked_at': time.time(),
@@ -568,7 +680,7 @@ def rebase_atlas(catalog, source_home, target_home, workspaces=()):
             'imported_workspaces': imported}
 
 
-def workspace_acceptance(root, source_home, target_home):
+def workspace_acceptance(root, source_home, target_home, source_missing_transient_workspaces=()):
     root, home = Path(root), Path(target_home)
     incoming = root / 'incoming'
     repositories = []
@@ -621,9 +733,13 @@ def workspace_acceptance(root, source_home, target_home):
     with connection(home / '.codex/state_5.sqlite') as c:
         roots = [{'path': row[0], 'exists': Path(row[0]).is_dir()} for row in c.execute('SELECT DISTINCT path FROM project_roots')]
         missing_cwd = [dict(row) for row in c.execute('SELECT id,cwd,git_sha FROM threads') if not Path(row['cwd']).is_dir()]
+    baseline = {(r['id'], r['cwd']) for r in source_missing_transient_workspaces if r.get('source_exists') is False}
+    transient = [r for r in missing_cwd if (r['id'], r['cwd']) in baseline]
+    missing_cwd = [r for r in missing_cwd if (r['id'], r['cwd']) not in baseline]
     return {'status': 'passed' if not errors and all(r['exists'] for r in roots) and not missing_cwd else 'needs_attention',
             'repositories': reports, 'git_errors': errors, 'source_git_markers_skipped': skipped,
             'project_roots': roots, 'missing_thread_workspaces': missing_cwd,
+            'source_missing_transient_workspaces': transient,
             'scope': 'project_directories_git_head_refs_and_full_object_integrity',
             'project_builds_executed': False, 'checked_at': time.time()}
 
