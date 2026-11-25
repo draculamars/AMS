@@ -22,6 +22,26 @@ def test_ssh_arguments_reject_option_and_shell_injection():
     assert args[-1] == 'user@lab-mac.local'
 
 
+def test_deployment_sends_verified_release_and_receiver_plan(env, monkeypatch):
+    plan = {'id':'a'*32, 'status':'native_verified', 'atlas':{'catalog':'AssetVault/catalog'},
+            'root':'/target/incoming', 'roots':[]}
+    migration.save(plan)
+    def package(args, **kw):
+        Path(args[-1]).write_bytes(b'verified-release')
+        return subprocess.CompletedProcess(args, 0, b'', b'')
+    sent = []
+    monkeypatch.setattr(migration.subprocess, 'run', package)
+    monkeypatch.setattr(migration, 'rsync', lambda *args: sent.append(args))
+    def remote(plan, action, timeout=90, **body):
+        assert action == 'deploy_atlas' and body['source_plan'] == plan
+        assert body['release_sha256'] == agent.digest(sent[0][1])
+        assert body['port'] == 8765
+        return {'status':'running'}
+    monkeypatch.setattr(migration, 'remote', remote)
+    assert migration.deploy_atlas(plan['id'])['status'] == 'running'
+    assert migration.read(plan['id'])['atlas_deployment']['status'] == 'running'
+
+
 def test_staging_cannot_overlap_any_activation_destination(tmp_path):
     roots = [{'relative': '.codex'}, {'relative': 'Documents/project'}]
     for relative in ['.codex/import', 'Documents/project/incoming', 'Documents']:

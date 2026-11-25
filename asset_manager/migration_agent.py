@@ -786,7 +786,7 @@ def deploy_atlas(body):
     app_python = app / '.venv/bin/python'
     execute([app_python, '-c', 'import fastapi,uvicorn,multipart,sqlite3'])
     source_home = json.loads((root / 'ATLAS-MIGRATION.json').read_text())['source_home']
-    rebased = profile.rebase_atlas(catalog, source_home, str(home), body.get('plan', {}).get('roots', []))
+    rebased = profile.rebase_atlas(catalog, source_home, str(home), body.get('source_plan', {}).get('roots', []))
     port = int(body.get('port', 8765))
     if not 1024 <= port <= 65535:
         raise ValueError('部署端口无效')
@@ -812,8 +812,8 @@ def deploy_atlas(body):
               'local_url_on_target': 'http://127.0.0.1:%s' % port, 'health': health,
               'node_rebinding': rebased, 'release_sha256': digest(release), 'installed_at': time.time()}
     atomic_json(root / 'evidence/atlas-deployment.json', report)
-    if body.get('plan'):
-        received = dict(body['plan'])
+    if body.get('source_plan'):
+        received = dict(body['source_plan'])
         received.update(role='receiver', status='received', phase='received', atlas_deployment=report,
             detail='此节点已接收迁移内容；原设备上的迁移任务继续保存完整执行记录',
             updated_at=time.time(), worker_pid=None)

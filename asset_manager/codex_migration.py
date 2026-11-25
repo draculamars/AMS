@@ -789,7 +789,7 @@ def deploy_atlas(ident, port=8765):
     if package.returncode:
         raise ValueError('Atlas 发布包生成失败：' + package.stderr.decode(errors='replace')[-1000:])
     rsync(plan, release, plan['root'] + '/evidence/atlas-release.zip', folder(ident) / 'deployment-transfer.log')
-    report = remote(plan, 'deploy_atlas', timeout=1800, atlas=plan['atlas'], port=port, plan=plan,
+    report = remote(plan, 'deploy_atlas', timeout=1800, atlas=plan['atlas'], port=port, source_plan=plan,
                     release_sha256=agent.digest(release))
     agent.atomic_json(folder(ident) / 'atlas-deployment.json', report)
     save(plan, atlas_deployment=report)
