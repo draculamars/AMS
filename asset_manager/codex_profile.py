@@ -711,6 +711,24 @@ def rebase_atlas(catalog, source_home, target_home, workspaces=()):
             'imported_workspaces': imported}
 
 
+def accepted_git_upgrade(source_refs, target_refs, source_head, target_head, receipt, is_ancestor):
+    """Only exact recorded additive/fast-forward changes can supersede a snapshot."""
+    if not receipt:
+        return False
+    def refs(raw):
+        return {line.split(' ',1)[1]:line.split(' ',1)[0] for line in raw.decode().splitlines()}
+    old,new=refs(source_refs),refs(target_refs)
+    changes={k:{'before':old.get(k),'after':new.get(k)} for k in old.keys()|new.keys() if old.get(k)!=new.get(k)}
+    if changes!=receipt.get('refs') or any(not v['after'] for v in changes.values()):return False
+    for ref,change in changes.items():
+        if not ref.startswith(('refs/heads/','refs/remotes/')):return False
+        if change['before'] and not is_ancestor(change['before'],change['after']):return False
+    before,after=source_head.decode().strip(),target_head.decode().strip()
+    if before!=after:
+        if receipt.get('head')!={'before':before,'after':after} or not is_ancestor(before,after):return False
+    return True
+
+
 def workspace_acceptance(root, source_home, target_home, source_missing_transient_workspaces=()):
     root, home = Path(root), Path(target_home)
     incoming = root / 'incoming'
@@ -728,6 +746,8 @@ def workspace_acceptance(root, source_home, target_home, source_missing_transien
             command += ['-C', str(cwd)]
         return subprocess.run(command + list(args), capture_output=True, timeout=180)
     reports, errors, skipped = [], [], []
+    upgrade_path=root/'evidence/git-upgrades.json'
+    upgrades=json.loads(upgrade_path.read_text()).get('repositories',{}) if upgrade_path.exists() else {}
     for rel in sorted(set(repositories)):
         original_marker = incoming / rel / '.git'
         gitdir = original_marker
@@ -755,10 +775,15 @@ def workspace_acceptance(root, source_home, target_home, source_missing_transien
         integrity = git(target, 'fsck', '--full', '--no-reflogs')
         same = (source_head.returncode == target_head.returncode and source_head.stdout == target_head.stdout
                 and source_refs.stdout == target_refs.stdout and not target_refs.returncode)
+        upgrade=upgrades.get(rel.as_posix())
+        upgraded=(not source_head.returncode and not target_head.returncode and not target_refs.returncode and
+            accepted_git_upgrade(source_refs.stdout,target_refs.stdout,source_head.stdout,target_head.stdout,upgrade,
+                lambda before,after:git(target,'merge-base','--is-ancestor',before,after).returncode==0))
         item = {'path': str(target), 'head': target_head.stdout.decode(errors='replace').strip(),
-                'refs_equal': same, 'fsck_exit': integrity.returncode}
-        if not same or integrity.returncode:
-            item['error'] = integrity.stderr.decode(errors='replace')[-1200:] or 'Git HEAD / refs 不一致'
+                'refs_equal': same, 'documented_upgrade':upgrade if upgraded else None,
+                'references_accepted':bool(same or upgraded),'fsck_exit': integrity.returncode}
+        if not (same or upgraded) or integrity.returncode:
+            item['error'] = integrity.stderr.decode(errors='replace')[-1200:] or 'Git HEAD / refs 不一致且没有可验证的升级记录'
             errors.append(item)
         reports.append(item)
     with connection(home / '.codex/state_5.sqlite') as c:

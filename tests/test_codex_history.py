@@ -234,3 +234,16 @@ def test_missing_physical_parent_never_passes_full_integrity(tmp_path):
     assert result['history_base_offsets']['status']=='failed'
     with pytest.raises(ValueError,match='截止位置不能可靠重建'):
         history.repair_offsets(home)
+
+
+def test_git_upgrade_never_accepts_unrecorded_or_rewound_references():
+    old=b'aaa refs/heads/main\n'
+    new=b'bbb refs/heads/main\nccc refs/remotes/atlas-sync/main\n'
+    proof={'refs':{'refs/heads/main':{'before':'aaa','after':'bbb'},
+        'refs/remotes/atlas-sync/main':{'before':None,'after':'ccc'}},'head':{'before':'aaa','after':'bbb'}}
+    yes=lambda a,b:True
+    assert profile.accepted_git_upgrade(old,new,b'aaa',b'bbb',proof,yes)
+    assert not profile.accepted_git_upgrade(old,new,b'aaa',b'bbb',None,yes)
+    assert not profile.accepted_git_upgrade(old,new,b'aaa',b'bbb',proof,lambda a,b:False)
+    assert not profile.accepted_git_upgrade(old,new+b'ddd refs/heads/unrecorded\n',b'aaa',b'bbb',proof,yes)
+    assert not profile.accepted_git_upgrade(old,b'',b'aaa',b'bbb',{'refs':{'refs/heads/main':{'before':'aaa','after':None}},'head':proof['head']},yes)
