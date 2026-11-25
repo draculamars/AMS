@@ -117,6 +117,10 @@ def watch_loop():
     while not STOP.wait(interval):
         started=time.monotonic()
         try:
+            from . import codex_migration
+            if any(p['status']=='running' for p in codex_migration.listing()):
+                set_status({'status':'waiting','detail':'Codex 迁移捕获期间暂停自动重建索引','checked_at':core.now()})
+                continue
             initialize()
             with db.connect() as c:
                 busy=c.execute("SELECT 1 FROM jobs WHERE status IN ('queued','running') LIMIT 1").fetchone()

@@ -107,6 +107,8 @@ def ingest(progress=lambda *a:None):
         projects=[dict(r) for r in c.execute('SELECT * FROM projects')]
         known_files={(r[0],r[1]) for r in c.execute('SELECT project_id,relpath FROM assets')}
         known={r['id']:json.loads(r['body']).get('source_revision') for r in c.execute('SELECT id,body FROM development_sessions')}
+    from . import path_aliases
+    projects=path_aliases.project_roots(projects)
     with readonly(root/'state_5.sqlite') as state, readonly(root/'thread_history_1.sqlite') as history:
         for table,columns,con in [('threads',{'id','cwd','title','updated_at','git_sha'},state),('thread_items',{'item_type','item_json','turn_id','item_id'},history)]:
             found={r['name'] for r in con.execute('PRAGMA table_info('+table+')')}

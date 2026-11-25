@@ -449,3 +449,6 @@ app.include_router(vault_router)
 
 from .web_api import router as web_router
 app.include_router(web_router)
+
+from .codex_migration_api import router as codex_migration_router
+app.include_router(codex_migration_router)

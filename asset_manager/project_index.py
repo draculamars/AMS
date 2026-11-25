@@ -114,6 +114,8 @@ def index_one(pid,progress=lambda *a:None,rescan=True):
         projects=[dict(x) for x in c.execute('SELECT id,path FROM projects')]
         lookup={(x['project_id'],x['relpath']):x['id'] for x in c.execute('SELECT project_id,relpath,id FROM assets WHERE present=1 OR EXISTS(SELECT 1 FROM versions WHERE asset_id=assets.id)')}
         previous=c.execute('SELECT * FROM project_index_runs WHERE project_id=? ORDER BY created_at DESC LIMIT 1',(pid,)).fetchone()
+    from . import path_aliases
+    projects=path_aliases.project_roots(projects)
     # Directory lookups are kept separate from file lookups; no fuzzy same-name dependency assertions.
     dirs=set()
     for source_pid,source_path in lookup:
