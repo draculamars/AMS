@@ -138,9 +138,10 @@ def source_roots(home, codex, discovery=None):
         except ImportError:
             import tomli as tomllib
         roots += [Path(p) for p in tomllib.loads(config.read_text()).get('projects', {})]
-    runtime = home / '.cache/codex-runtimes'
-    if runtime.exists():
-        roots.append(runtime)
+    for name in ['.cache/codex-runtimes', '.local/share/uv/python']:
+        runtime = home / name
+        if runtime.exists():
+            roots.append(runtime)
     for name in ['.cache/huggingface/hub', '.cache/huggingface/datasets', '.cache/huggingface/lerobot',
                  '.cache/torch/hub', '.cache/torch/checkpoints', '.cache/whisper', '.ollama/models', '.lmstudio/models']:
         path = home / name
@@ -185,6 +186,40 @@ def database_paths(roots, codex):
     if (db.DATA / 'catalog.sqlite3').exists() and any(db.DATA.is_relative_to(r) for r in roots):
         paths.append(db.DATA / 'catalog.sqlite3')
     return [p for p in paths if p.is_file() and not p.is_symlink()]
+
+
+def active_files(plan):
+    """Inspect open writers without stopping source applications or devices."""
+    executable = shutil.which('lsof')
+    if not executable or os.name == 'nt':
+        return []
+    result = subprocess.run([executable, '-nP', '-F', 'pftan', '-u', str(os.getuid())],
+                            capture_output=True, text=True, timeout=60)
+    roots = [Path(r['source']) for r in plan['roots']]
+    current, found = {}, {}
+    pid = ''
+    for line in result.stdout.splitlines() + ['fEND']:
+        if line.startswith('p'):
+            pid = line[1:]
+        if line.startswith('f'):
+            if current.get('t') == 'REG' and current.get('a') in {'u', 'w'}:
+                path = Path(current.get('n', ''))
+                if path.is_absolute() and any(path.is_relative_to(r) for r in roots) and not filtered(plan, path) and path.is_file() and not path.is_symlink():
+                    kind = 'runtime_lock' if path.name in {'agent.lock', 'server.lock', 'process.lock', '.dds-log.lock', 'server.pid'} else 'live_file'
+                    found[str(path)] = {'path': str(path), 'kind': kind}
+            current = {'pid': pid}
+        elif line and line[0] in 'tan':
+            current[line[0]] = line[1:]
+    return sorted(found.values(), key=lambda r: r['path'])
+
+
+def include_active_files(plan):
+    inspection = active_files(plan)
+    plan['active_file_inspection'] = inspection
+    plan['frozen_files'] = [r['path'] for r in inspection if r['kind'] == 'live_file']
+    for row in inspection:
+        plan['excluded'].append({'path': row['path'], 'reason':
+            '源机仍在运行的进程锁，在目标重建' if row['kind'] == 'runtime_lock' else '活动文件单独冻结副本，保持源机服务运行'})
 
 
 def make_plan(body):
@@ -246,6 +281,7 @@ def make_plan(body):
             'created_at': time.time(), 'progress': {}, 'source_deleted': False, 'activation': 'not_started'}
     plan['desktop_archives'] = desktop_archives(home)
     plan['historical_workspace_discovery'] = discovery
+    include_active_files(plan)
     if body.get('include_atlas', True):
         plan['atlas'] = {'catalog': db.DATA.relative_to(home).as_posix(),
                          'archive': db.blob_root().relative_to(home).as_posix(),
@@ -342,7 +378,7 @@ def snapshot_database(path, destination):
             'xattrs': agent.attributes(path), 'captured_at': time.time()}
 
 
-def snapshot_file(path, destination):
+def snapshot_file(path, destination, preserve_mode=False):
     """Freeze append-only rollouts without holding a multi-GiB file in memory."""
     destination.unlink(missing_ok=True)
     if sys.platform == 'darwin':
@@ -360,8 +396,9 @@ def snapshot_file(path, destination):
             source.seek(-1, 2)
             if source.read(1) != b'\n':
                 raise ValueError('会话末尾仍在写入，请稍后续传：' + str(path))
-    destination.chmod(0o600)
-    return {'sha256': agent.digest(destination), 'size': destination.stat().st_size, 'mode': 0o600,
+    mode = stat.S_IMODE(destination.stat().st_mode) if preserve_mode else 0o600
+    destination.chmod(mode)
+    return {'sha256': agent.digest(destination), 'size': destination.stat().st_size, 'mode': mode,
             'xattrs': agent.attributes(destination), 'captured_at': time.time()}
 
 
@@ -474,9 +511,10 @@ def transfer(ident):
                 remote(plan, 'mkdir', paths=directories)
             persistent += [codex / name for name in ['.codex-global-state.json', '.codex-global-state.json.bak', 'session_index.jsonl'] if (codex / name).is_file()]
             persistent += [Path(p) for p in plan.get('desktop_archives', desktop_archives(plan['source_home']))]
+            persistent += [Path(p) for p in plan.get('frozen_files', [])]
             for source in persistent:
                 snapshot = location / 'persistent-snapshot'
-                info = snapshot_file(source, snapshot)
+                info = snapshot_file(source, snapshot, preserve_mode=str(source) in plan.get('frozen_files', []))
                 relative = source.relative_to(plan['source_home']).as_posix()
                 remote(plan, 'mkdir', paths=[str(Path(relative).parent)])
                 rsync(plan, snapshot, plan['root'] + '/incoming/' + relative, log)

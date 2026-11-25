@@ -348,3 +348,37 @@ def test_discovery_includes_historical_working_projects_and_model_weights(tmp_pa
     assert project in roots and cache in roots
     assert home not in roots and home/'Documents' not in roots and browser not in roots
     assert str(home/'AI/deleted') in discovery['missing']
+
+
+def test_live_writer_capture_preserves_source_and_distinguishes_runtime_locks(tmp_path,monkeypatch):
+    from types import SimpleNamespace
+    project=tmp_path/'project';project.mkdir()
+    log=project/'runtime.log';log.write_text('before\n');log.chmod(0o640)
+    lock=project/'agent.lock';lock.write_text('123')
+    read_only=project/'model.json';read_only.write_text('{}')
+    output='p123\nf1\nau\ntREG\nn'+str(log)+'\nf2\naw\ntREG\nn'+str(lock)+'\nf3\nar\ntREG\nn'+str(read_only)+'\nf4\nau\ntREG\nn/private/protected/system.db\n'
+    with monkeypatch.context() as patch:
+        patch.setattr(migration.shutil,'which',lambda _: '/usr/sbin/lsof')
+        patch.setattr(migration.subprocess,'run',lambda *a,**kw:SimpleNamespace(stdout=output))
+        patch.setattr(Path,'is_file',lambda p: True if p.is_relative_to(project) else pytest.fail('Must not inspect files outside selected roots'))
+        plan={'roots':[{'source':str(project)}],'excluded':[]}
+        migration.include_active_files(plan)
+    assert plan['frozen_files']==[str(log)]
+    assert migration.filtered(plan,lock) and not migration.filtered(plan,read_only)
+    snapshot=tmp_path/'snapshot';info=migration.snapshot_file(log,snapshot,preserve_mode=True)
+    with log.open('a') as f:f.write('after\n')
+    assert snapshot.read_text()=='before\n' and log.read_text()=='before\nafter\n'
+    assert info['mode']==0o640 and info['sha256']==agent.digest(snapshot)
+
+
+def test_python_environment_references_rebase_without_rewriting_code_or_readme(tmp_path):
+    root=tmp_path/'project';env=root/'.venv';(env/'bin').mkdir(parents=True)
+    (env/'pyvenv.cfg').write_text('home = /old/user/python/bin\nversion_info = 3.12\n')
+    entry=env/'bin/tool';entry.write_text('#!/old/user/project/.venv/bin/python\nprint("Historical /old/user")\n');entry.chmod(0o755)
+    packages=env/'lib/python3.12/site-packages';packages.mkdir(parents=True)
+    (packages/'editable.pth').write_text('/old/user/project/src\nimport unrelated_loader\n')
+    profile.repair_references([root],'/old/user','/new/user')
+    assert (env/'pyvenv.cfg').read_text().startswith('home = /new/user/python/bin\n')
+    assert entry.read_text()=='#!/new/user/project/.venv/bin/python\nprint("Historical /old/user")\n'
+    assert entry.stat().st_mode & 0o777==0o755
+    assert (packages/'editable.pth').read_text()=='/new/user/project/src\nimport unrelated_loader\n'

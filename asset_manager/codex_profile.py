@@ -265,6 +265,35 @@ def repair_references(roots, source_home, target_home):
                         changed.append({'path': str(path), 'kind': 'symlink', 'before': before, 'after': after})
                     elif os.path.isabs(before) and not path.exists():
                         external.append({'path': str(path), 'target': before})
+                elif path.is_file() and name == 'pyvenv.cfg':
+                    before = path.read_text()
+                    lines = []
+                    for line in before.splitlines(keepends=True):
+                        key, separator, value = line.partition('=')
+                        if separator and key.strip() in {'home', 'executable', 'base-prefix', 'base-exec-prefix', 'base-executable'}:
+                            mapped = map_path(value.strip(), source_home, target_home)
+                            if mapped != value.strip():
+                                value = value.replace(value.strip(), mapped, 1)
+                        lines.append(key + separator + value)
+                    after = ''.join(lines)
+                    if before != after:
+                        path.write_text(after)
+                        changed.append({'path': str(path), 'kind': 'python_environment'})
+                elif path.is_file() and path.parent.name == 'bin' and (path.parent.parent / 'pyvenv.cfg').is_file():
+                    with path.open('rb') as f:
+                        first = f.readline(4096)
+                    prefix = ('#!' + source_home + '/').encode()
+                    if first.startswith(prefix):
+                        after = ('#!' + target_home).encode() + first[len(('#!' + source_home).encode()):]
+                        content = path.read_bytes()
+                        path.write_bytes(after + content[len(first):])
+                        changed.append({'path': str(path), 'kind': 'python_entrypoint'})
+                elif path.is_file() and path.suffix == '.pth' and path.parent.name == 'site-packages':
+                    before = path.read_text()
+                    after = ''.join(map_path(line, source_home, target_home) for line in before.splitlines(keepends=True))
+                    if before != after:
+                        path.write_text(after)
+                        changed.append({'path': str(path), 'kind': 'python_search_path'})
                 elif path.is_file() and (name == '.git' or (name in {'gitdir', 'commondir'} and '.git' in path.parts)):
                     before = path.read_text()
                     prefix = 'gitdir: ' if before.startswith('gitdir: ') else ''
