@@ -10,6 +10,7 @@ from test_assets import env, client, HEADERS
 from asset_manager import codex_migration as migration, migration_agent as agent
 from asset_manager import codex_profile as profile
 from asset_manager import codex_attachments as attachments
+from asset_manager import migration_tools
 
 
 def test_ssh_arguments_reject_option_and_shell_injection():
@@ -19,6 +20,98 @@ def test_ssh_arguments_reject_option_and_shell_injection():
     args = migration.ssh_arguments({'host': 'user@lab-mac.local', 'port': 2222})
     assert '-oStrictHostKeyChecking=yes' in args
     assert args[-1] == 'user@lab-mac.local'
+
+
+def test_staging_cannot_overlap_any_activation_destination(tmp_path):
+    roots = [{'relative': '.codex'}, {'relative': 'Documents/project'}]
+    for relative in ['.codex/import', 'Documents/project/incoming', 'Documents']:
+        with pytest.raises(ValueError, match='重叠'):
+            agent.validate_staging_root(tmp_path / relative, tmp_path, roots)
+    agent.validate_staging_root(tmp_path / 'MigrationInbox/job', tmp_path, roots)
+    outside = tmp_path.parent / (tmp_path.name + '-outside')
+    outside.mkdir()
+    (tmp_path / 'linked').symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match='外部链接'):
+        agent.validate_staging_root(tmp_path / 'MigrationInbox/job', tmp_path,
+                                    [{'relative': 'linked/project'}], resolve_paths=True)
+
+
+def test_runtime_discovery_follows_user_launcher_package_without_login_profiles(tmp_path):
+    codex = tmp_path / '.codex'; codex.mkdir()
+    launchers = tmp_path / '.local/bin'; launchers.mkdir(parents=True)
+    package = tmp_path / '.local/share/example-cli'; package.mkdir(parents=True)
+    (package / 'cli').write_text('runtime')
+    (launchers / 'example').symlink_to(package / 'cli')
+    login = tmp_path / '.example-account'; login.mkdir()
+    node = tmp_path / '.nvm'; node.mkdir()
+    roots = migration.source_roots(tmp_path, codex)
+    assert launchers in roots and package in roots and node in roots
+    assert login not in roots and tmp_path not in roots
+
+
+def test_tool_supplement_preserves_configuration_and_refuses_repeat(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    root = tmp_path / 'MigrationInbox/tools'
+    agent.prepare({'root': str(root), 'id': 'tools', 'source_home': '/old'})
+    executable = root / 'incoming/tools/bin/node'
+    executable.parent.mkdir(parents=True)
+    executable.write_text('#!/bin/sh\nprintf "fixture-version\\n"\n'); executable.chmod(0o755)
+    manifest = root / 'evidence/source-manifest.jsonl'; manifest.write_text('fixture\n')
+    agent.atomic_json(root / 'evidence/verification.json', {'status': 'passed', 'manifest_sha256': agent.digest(manifest)})
+    config = tmp_path / '.codex/config.toml'; config.parent.mkdir()
+    original = '[shell_environment_policy.set]\nPATH="/custom/bin"\n[mcp_servers.keep]\ncommand="/keep"\n'
+    config.write_text(original)
+    body = {'root': str(root), 'id': 'tools', 'roots': ['tools'], 'node_bin': 'tools/bin',
+            'probes': [{'name': 'node', 'relative': 'tools/bin/node', 'args': ['--version']}]}
+    report = migration_tools.install(body, agent, profile)
+    assert report['status'] == 'passed' and report['checks'][0]['output'] == 'fixture-version\n'
+    assert (root / 'evidence/target-config-before-tools.toml').read_text() == original
+    assert profile.load_toml(config)['mcp_servers']['keep']['command'] == '/keep'
+    assert profile.load_toml(config)['shell_environment_policy']['set']['PATH'].startswith('/custom/bin:')
+    with pytest.raises(ValueError, match='目标目录已存在'):
+        migration_tools.install(body, agent, profile)
+    assert executable.read_text() == (tmp_path / 'tools/bin/node').read_text()
+
+
+def test_tool_supplement_rejects_unverified_content_before_writing(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    root = tmp_path / 'MigrationInbox/tools'
+    agent.prepare({'root': str(root), 'id': 'tools', 'source_home': '/old'})
+    agent.atomic_json(root / 'evidence/verification.json', {'status': 'failed'})
+    with pytest.raises(ValueError, match='未通过完整校验'):
+        migration_tools.install({'root': str(root), 'id': 'tools'}, agent, profile)
+    assert not (tmp_path / 'tools').exists()
+
+
+@pytest.mark.parametrize('empty', ['', 'turns', 'items', 'skills', 'resume'])
+def test_native_acceptance_requires_actual_history_and_resume(tmp_path, monkeypatch, empty):
+    codex = tmp_path / '.codex'; codex.mkdir()
+    cwd = tmp_path / 'project'; cwd.mkdir()
+    cli = tmp_path / 'codex-cli'; cli.write_text('fixture')
+    monkeypatch.setattr(profile.shutil, 'which', lambda _: str(cli))
+    with sqlite3.connect(codex / 'state_5.sqlite') as c:
+        c.execute('CREATE TABLE threads(id TEXT,attached_thread_parent_id TEXT)')
+        c.execute("INSERT INTO threads VALUES('one',NULL)")
+    with sqlite3.connect(codex / 'thread_history_1.sqlite') as c:
+        c.execute('CREATE TABLE thread_turns(thread_id TEXT)')
+        c.execute("INSERT INTO thread_turns VALUES('one')")
+        c.execute('CREATE TABLE thread_items(thread_id TEXT)')
+        c.execute("INSERT INTO thread_items VALUES('one')")
+    class Client:
+        def __init__(self, *args): pass
+        def close(self): pass
+        def request(self, method, params, **kw):
+            if method == 'thread/list': return {'data': [{'id': 'one'}]}
+            if method == 'thread/read': return {'thread': {'id': 'one', 'cwd': str(cwd)}}
+            if method == 'thread/turns/list': return {'data': [] if empty == 'turns' else [{'id': 'turn'}]}
+            if method == 'thread/items/list': return {'data': [] if empty == 'items' else [{'type': 'userMessage'}]}
+            if method == 'thread/resume': return {'thread': {'id': 'wrong' if empty == 'resume' else 'one'}, 'cwd': str(cwd)}
+            if method == 'skills/list': return {'data': [] if empty == 'skills' else [{'cwd': str(cwd), 'skills': []}]}
+            pytest.fail('Unexpected native request: ' + method)
+    monkeypatch.setattr(profile, 'NativeCodex', Client)
+    result = profile.native_acceptance(codex, tmp_path, ['one'], [])
+    assert result['status'] == ('failed' if empty else 'passed')
+    assert result['model_turns_started'] is False
 
 
 def test_sqlite_snapshot_includes_wal_and_preserves_source(tmp_path):

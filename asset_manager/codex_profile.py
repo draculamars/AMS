@@ -454,10 +454,15 @@ def native_acceptance(codex_home, evidence, source_ids, destination_ids):
         history_samples = []
         with connection(codex_home / 'thread_history_1.sqlite') as c:
             samples = [r[0] for r in c.execute('SELECT thread_id FROM thread_turns GROUP BY thread_id ORDER BY count(*) DESC')]
+            item_counts = dict(c.execute('SELECT thread_id,count(*) FROM thread_items GROUP BY thread_id'))
         for ident in samples:
             try:
                 result = client.request('thread/turns/list', {'threadId': ident, 'limit': 1, 'itemsView': 'summary'})
                 items = client.request('thread/items/list', {'threadId': ident, 'limit': 2})
+                if not result.get('data'):
+                    raise ValueError('数据库中有历史轮次，但原生接口返回空历史')
+                if item_counts.get(ident) and not items.get('data'):
+                    raise ValueError('数据库中有会话内容，但原生接口返回空内容')
                 history_samples.append({'id': ident, 'returned_turns': len(result.get('data', [])),
                                         'returned_items': len(items.get('data', [])),
                                         'item_types': [r.get('type') for r in items.get('data', [])]})
@@ -471,14 +476,20 @@ def native_acceptance(codex_home, evidence, source_ids, destination_ids):
             candidate = min(candidates, key=lambda r: sizes.get(r['id'], 0) or 10**9)
             try:
                 response = client.request('thread/resume', {'threadId': candidate['id'], 'cwd': candidate['cwd'], 'excludeTurns': True}, timeout=120)
+                if response.get('thread', {}).get('id') != candidate['id'] or response.get('cwd') != candidate['cwd']:
+                    raise ValueError('原生接续返回的会话或目录与请求不符')
                 resume_test = {'id': response['thread']['id'], 'cwd': response['cwd'], 'status': 'resumed_without_new_turn'}
                 found = client.request('skills/list', {'cwds': [candidate['cwd']], 'forceReload': True}, timeout=120)
                 skills = [{'cwd': row.get('cwd'), 'count': len(row.get('skills', [])),
                            'errors': row.get('errors', [])} for row in found.get('data', [])]
+                if not any(row['cwd'] == candidate['cwd'] for row in skills):
+                    errors.append({'component': 'skills', 'error': '原生技能发现未返回待验收工作目录'})
                 if any(row['errors'] for row in skills):
                     errors.append({'component': 'skills', 'error': '部分技能未通过原生发现，详见技能报告'})
             except ValueError as exc:
                 errors.append({'component': 'resume_or_skills', 'error': str(exc)})
+        elif source_ids:
+            errors.append({'component': 'resume', 'error': '没有可接续的迁入工程目录'})
         return {'status': 'passed' if not missing and not errors else 'failed',
                 'source_threads': len(source_ids), 'preserved_target_threads': len(destination_ids),
                 'listed_threads': len(listed), 'read_threads': len(checked), 'missing_ids': missing,

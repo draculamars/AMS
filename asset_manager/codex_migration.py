@@ -22,7 +22,7 @@ import time
 import uuid
 import zlib
 from pathlib import Path
-from . import db, migration_agent as agent, codex_profile, codex_attachments
+from . import db, migration_agent as agent, codex_profile, codex_attachments, migration_tools
 
 CODEx_TRANSIENT = {'ipc', 'tmp', '.tmp', 'app-server-control', 'thread-writer-locks',
                    'project-metadata-locks', 'process_manager', 'shell_snapshots',
@@ -60,6 +60,8 @@ def listing():
     result = []
     for p in sorted((db.DATA / 'codex-migrations').glob('*/plan.json'), key=lambda p: p.stat().st_mtime, reverse=True):
         value = json.loads(p.read_text(encoding='utf-8'))
+        if value.get('role') == 'tool_supplement':
+            continue  # Supplemental receipts are presented by their parent task.
         result.append({k: value.get(k) for k in ['id', 'name', 'status', 'phase', 'detail', 'host', 'root',
                        'created_at', 'updated_at', 'progress', 'result', 'worker_pid']})
     return result
@@ -82,9 +84,12 @@ def remote(plan, action, timeout=90, **body):
     encoded = base64.b64encode(zlib.compress(source, 9)).decode()
     profile = base64.b64encode(zlib.compress(Path(codex_profile.__file__).read_bytes(), 9)).decode()
     attachments = base64.b64encode(zlib.compress(Path(codex_attachments.__file__).read_bytes(), 9)).decode()
+    runtime_tools = base64.b64encode(zlib.compress(Path(migration_tools.__file__).read_bytes(), 9)).decode()
     program = ("import base64,zlib,types,sys;a=types.ModuleType('atlas_codex_attachments');sys.modules[a.__name__]=a;"
                "exec(zlib.decompress(base64.b64decode('" + attachments + "')),a.__dict__);m=types.ModuleType('atlas_codex_profile');"
                "sys.modules[m.__name__]=m;exec(zlib.decompress(base64.b64decode('" + profile + "')),m.__dict__);"
+               "t=types.ModuleType('atlas_migration_tools');sys.modules[t.__name__]=t;"
+               "exec(zlib.decompress(base64.b64decode('" + runtime_tools + "')),t.__dict__);"
                "exec(zlib.decompress(base64.b64decode('" + encoded + "')))")
     command = 'python3 -c ' + shlex.quote(program)
     if plan.get('target', {}).get('platform') == 'Darwin':
@@ -143,10 +148,21 @@ def source_roots(home, codex, discovery=None):
         except ImportError:
             import tomli as tomllib
         roots += [Path(p) for p in tomllib.loads(config.read_text()).get('projects', {})]
-    for name in ['.cache/codex-runtimes', '.local/share/uv/python']:
+    for name in ['.cache/codex-runtimes', '.local/share/uv/python', '.nvm', '.local/bin', '.hf-cli']:
         runtime = home / name
         if runtime.exists():
             roots.append(runtime)
+    # User launchers often point to packages outside engineering directories.
+    # Preserve package directories under .local/share, without importing login
+    # profiles from unrelated dot-directories or traversing the whole home.
+    launchers = home / '.local/bin'
+    if launchers.is_dir():
+        share = home / '.local/share'
+        for launcher in launchers.iterdir():
+            if launcher.is_symlink():
+                target = launcher.resolve()
+                if target.is_relative_to(share) and len(target.relative_to(share).parts) > 1:
+                    roots.append(share / target.relative_to(share).parts[0])
     for name in ['.cache/huggingface/hub', '.cache/huggingface/datasets', '.cache/huggingface/lerobot',
                  '.cache/torch/hub', '.cache/torch/checkpoints', '.cache/whisper', '.ollama/models', '.lmstudio/models']:
         path = home / name
@@ -278,6 +294,7 @@ def make_plan(body):
             excluded.append({'path': str(path) + suffix, 'reason': '数据库单独生成一致快照'})
     rows = [{'source': str(p), 'relative': p.relative_to(home).as_posix(),
              'target': str(Path(target['home']) / p.relative_to(home))} for p in roots]
+    agent.validate_staging_root(root_path, target['home'], rows)
     plan = {'id': ident, 'name': body.get('name') or 'Codex 跨机迁移', **probe, 'root': str(root_path),
             'source_home': str(home), 'target_home': target['home'], 'source': agent.inspect_home(home),
             'target': target, 'roots': rows, 'databases': [str(p) for p in databases],
@@ -286,6 +303,14 @@ def make_plan(body):
             'created_at': time.time(), 'progress': {}, 'source_deleted': False, 'activation': 'not_started'}
     plan['desktop_archives'] = desktop_archives(home)
     plan['historical_workspace_discovery'] = discovery
+    bins = []
+    for name in ['node', 'npm', 'uv', 'uvx', 'hf', 'lark-cli']:
+        executable = shutil.which(name)
+        if executable:
+            directory = Path(executable).parent
+            if any(directory.is_relative_to(root) for root in roots):
+                bins.append(directory.relative_to(home).as_posix())
+    plan['tool_runtime'] = {'bin_dirs': list(dict.fromkeys(bins)), 'target_existing_settings_preferred': True}
     include_active_files(plan)
     if body.get('include_atlas', True):
         plan['atlas'] = {'catalog': db.DATA.relative_to(home).as_posix(),
@@ -633,7 +658,8 @@ def _activation_worker(ident, activate=False):
         if not activate:
             capture_external_attachments(plan)
         report = remote(plan, action, timeout=24 * 3600, roots=plan['roots'], allow_app_restart=activate,
-                        refresh=not activate, attachments_sha256=plan.get('external_attachments', {}).get('manifest_sha256'))
+                        refresh=not activate, attachments_sha256=plan.get('external_attachments', {}).get('manifest_sha256'),
+                        tool_runtime=plan.get('tool_runtime', {}))
         save(plan, status='activated_pending_acceptance' if activate else 'activation_prepared',
              activation=report, detail='已接入目标 Codex，待原生功能验收' if activate else '接续副本已准备，原有环境尚未切换')
     except BaseException as exc:
@@ -701,7 +727,13 @@ def deploy_atlas(ident, port=8765):
             'archive': db.blob_root().relative_to(home).as_posix(),
             'application': Path(__file__).resolve().parents[1].relative_to(home).as_posix(),
             'python_environment': Path(sys.prefix).relative_to(home).as_posix()}
-    report = remote(plan, 'deploy_atlas', timeout=1800, atlas=plan['atlas'], port=port, plan=plan)
+    release = folder(ident) / 'atlas-release.zip'
+    package = subprocess.run([sys.executable, str(Path(__file__).resolve().parents[1] / 'scripts/package-release.py'), str(release)], capture_output=True, timeout=300)
+    if package.returncode:
+        raise ValueError('Atlas 发布包生成失败：' + package.stderr.decode(errors='replace')[-1000:])
+    rsync(plan, release, plan['root'] + '/evidence/atlas-release.zip', folder(ident) / 'deployment-transfer.log')
+    report = remote(plan, 'deploy_atlas', timeout=1800, atlas=plan['atlas'], port=port, plan=plan,
+                    release_sha256=agent.digest(release))
     agent.atomic_json(folder(ident) / 'atlas-deployment.json', report)
     save(plan, atlas_deployment=report)
     return report
@@ -717,8 +749,34 @@ def reports(ident):
         return {p.name: json.loads(p.read_text()) for p in (root / 'evidence').glob('*.json')
                 if p.name in {'verification.json', 'activation.json', 'native-acceptance.json',
                               'atlas-deployment.json', 'workspace-acceptance.json', 'completion.json',
-                              'attachment-recovery.json', 'attachment-recovery-progress.json'}}
+                              'attachment-recovery.json', 'attachment-recovery-progress.json',
+                              'tool-verification.json', 'tool-installation.json'}}
     return remote(plan, 'report')
+
+
+def install_tools(ident, supplement_id):
+    plan, supplement = read(ident), read(supplement_id)
+    if plan['status'] not in {'activated_pending_acceptance', 'native_verified'}:
+        raise ValueError('请先接入目标 Codex')
+    if supplement.get('parent_migration') != ident or supplement.get('verification', {}).get('status') != 'passed':
+        raise ValueError('补充任务不属于本次迁移或未通过文件校验')
+    node = shutil.which('node')
+    if not node or not Path(node).is_relative_to(plan['source_home']):
+        raise ValueError('无法确定来源用户 Node 运行版本')
+    node_bin = Path(node).parent.relative_to(plan['source_home']).as_posix()
+    candidates = [('node', node_bin + '/node', ['--version'])] + [
+        (name, '.local/bin/' + name, ['version'] if name == 'hf' else ['--version'])
+        for name in ['uv', 'uvx', 'lark-cli', 'hf', 'claude']]
+    probes = [{'name': name, 'relative': relative, 'args': args} for name, relative, args in candidates
+              if (Path(plan['source_home']) / relative).is_file()]
+    entry = str(Path(plan['atlas']['catalog']).parent / 'tools/migration-env.sh') if plan.get('atlas') else '.config/atlas/migration-env.sh'
+    report = remote(plan, 'install_tools', timeout=1800, supplement_root=supplement['root'], supplement_id=supplement_id,
+        tool_roots=[r['relative'] for r in supplement['roots']], node_bin=node_bin, probes=probes, environment_entry=entry)
+    agent.atomic_json(folder(ident) / 'tool-installation.json', report)
+    save(plan, tool_supplement={'id': supplement_id, 'status': report['status'],
+         'entries': supplement['verification']['entries'], 'bytes': supplement['verification']['bytes']})
+    save(supplement, status='tool_installed' if report['status'] == 'passed' else 'needs_attention', tool_installation=report)
+    return report
 
 
 def verify_workspaces(ident):
@@ -749,6 +807,8 @@ def complete(ident):
             raise ValueError('验收尚未通过：' + name)
     if plan.get('atlas') and receipt.get('atlas-deployment.json', {}).get('status') != 'running':
         raise ValueError('目标 Atlas 尚未完成部署')
+    if plan.get('tool_supplement') and receipt.get('tool-installation.json', {}).get('status') != 'passed':
+        raise ValueError('补充工具尚未通过目标运行验收')
     result = remote(plan, 'complete', timeout=60)
     save(plan, status='complete', phase='complete', completion=result,
          detail='文件、原生会话、工程 Git 与目标 Atlas 验收通过；源机保留，工程构建和外部设备未逐项执行')
@@ -758,8 +818,9 @@ def complete(ident):
 def main():
     import argparse
     parser = argparse.ArgumentParser(description='Atlas Codex 迁移')
-    parser.add_argument('action', choices=['plan', 'start', 'worker', 'status', 'prepare-profile', 'activate', 'verify-native', 'deploy-atlas', 'verify-workspaces', 'complete'])
+    parser.add_argument('action', choices=['plan', 'start', 'worker', 'status', 'prepare-profile', 'activate', 'verify-native', 'deploy-atlas', 'verify-workspaces', 'install-tools', 'complete'])
     parser.add_argument('value', nargs='?')
+    parser.add_argument('--supplement')
     args = parser.parse_args()
     if args.action == 'worker':
         transfer(args.value)
@@ -771,6 +832,10 @@ def main():
         print(json.dumps(deploy_atlas(args.value),ensure_ascii=False))
     elif args.action == 'verify-workspaces':
         print(json.dumps(verify_workspaces(args.value),ensure_ascii=False))
+    elif args.action == 'install-tools':
+        if not args.supplement:
+            parser.error('install-tools requires --supplement TASK_ID')
+        print(json.dumps(install_tools(args.value, args.supplement), ensure_ascii=False))
     elif args.action == 'complete':
         print(json.dumps(complete(args.value),ensure_ascii=False))
     elif args.action == 'plan':

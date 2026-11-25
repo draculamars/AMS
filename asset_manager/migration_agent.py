@@ -151,6 +151,24 @@ def checked_root(value, create=False):
     return root
 
 
+def validate_staging_root(root, target_home, roots, resolve_paths=False):
+    """Never clone a destination profile into a descendant of itself."""
+    root, home = Path(root), Path(target_home)
+    if resolve_paths:
+        root, home = root.resolve(), home.resolve()
+    for row in roots:
+        relative = Path(row['relative'])
+        if relative.is_absolute() or '..' in relative.parts or relative == Path('.'):
+            raise ValueError('接续目录越界')
+        destination = home / relative
+        if resolve_paths:
+            destination = destination.resolve()
+        if not destination.is_relative_to(home):
+            raise ValueError('接续目录穿过外部链接')
+        if root.is_relative_to(destination) or destination.is_relative_to(root):
+            raise ValueError('暂存目录不能与接续目录重叠：' + str(relative))
+
+
 def prepare(body):
     root = checked_root(body['root'], True)
     marker = root / 'ATLAS-MIGRATION.json'
@@ -303,6 +321,7 @@ def prepare_activation(body):
     import atlas_codex_profile as profile
     import atlas_codex_attachments as attachments
     root = checked_root(body['root'])
+    validate_staging_root(root, Path.home(), body.get('roots', []), resolve_paths=True)
     receipt = json.loads((root / 'evidence/verification.json').read_text())
     if receipt['status'] != 'passed' or receipt.get('manifest_sha256') != digest(root / 'evidence/source-manifest.jsonl'):
         raise ValueError('内容尚未校验通过，禁止准备接续环境')
@@ -408,6 +427,17 @@ def prepare_activation(body):
         # Source transient queue, goals and logs stay archived, never replayed.
     merged_config, config_conflicts = profile.merge_config(profile.load_toml(src / 'config.toml'),
         profile.load_toml(target / 'config.toml'), source_home, target_home)
+    runtime_bins = body.get('tool_runtime', {}).get('bin_dirs', [])
+    if runtime_bins:
+        directories = []
+        for value in runtime_bins:
+            relative = Path(value)
+            if relative.is_absolute() or '..' in relative.parts or not any(relative.is_relative_to(Path(r['relative'])) for r in body['roots']):
+                raise ValueError('工具 PATH 不属于迁移目录')
+            directories.append(str(Path(target_home) / relative))
+        variables = merged_config.setdefault('shell_environment_policy', {}).setdefault('set', {})
+        prior_path = variables.get('PATH') or os.environ.get('PATH', '/usr/bin:/bin:/usr/sbin:/sbin')
+        variables['PATH'] = ':'.join(dict.fromkeys(prior_path.split(':') + directories))
     if (working / 'config.toml').is_symlink():
         (working / 'config.toml').unlink()  # Prepared link only; incoming original remains.
     (working / 'config.toml').write_text(profile.toml_text(merged_config))
@@ -671,7 +701,13 @@ def deploy_atlas(body):
         return result.stdout.decode(errors='replace')
     execute([python, '-c', 'import sys,sqlite3;assert sys.version_info[:2]==(3,12)'])
     release = vault / 'backups' / ('atlas-migration-' + body['id'][:12] + '.zip')
-    execute([python, source_app / 'scripts/package-release.py', release], timeout=300)
+    if body.get('release_sha256'):
+        supplied = root / 'evidence/atlas-release.zip'
+        if digest(supplied) != body['release_sha256']:
+            raise ValueError('Atlas 发布包 SHA-256 不一致')
+        profile.clone(supplied, release)
+    else:
+        execute([python, source_app / 'scripts/package-release.py', release], timeout=300)
     execute([python, source_app / 'scripts/install-release.py', release, '--root', vault], timeout=300)
     execute([python, '-m', 'venv', '--without-pip', app / '.venv'])
     source_env = under_home(atlas['python_environment'])
@@ -753,6 +789,19 @@ def main():
         result = {'ready': True}
     elif action == 'deploy_atlas':
         result = deploy_atlas(body)
+    elif action == 'install_tools':
+        import atlas_codex_profile as profile
+        import atlas_migration_tools as runtime_tools
+        root = checked_root(body['root'])
+        marker = json.loads((root / 'ATLAS-MIGRATION.json').read_text())
+        activation = json.loads((root / 'evidence/activation.json').read_text())
+        if marker['id'] != body['id'] or activation['status'] not in {'activated_pending_acceptance', 'accepted'}:
+            raise ValueError('请先接入目标环境')
+        supplement = checked_root(body['supplement_root'])
+        result = runtime_tools.install({**body, 'root': str(supplement), 'id': body['supplement_id'],
+                                       'roots': body['tool_roots']}, sys.modules[__name__], profile)
+        atomic_json(root / 'evidence/tool-verification.json', json.loads((supplement / 'evidence/verification.json').read_text()))
+        atomic_json(root / 'evidence/tool-installation.json', result)
     elif action == 'verify_workspaces':
         import atlas_codex_profile as profile
         root = checked_root(body['root'])
@@ -803,7 +852,7 @@ def main():
     elif action == 'report':
         root = checked_root(body['root'])
         result = {}
-        for name in ['verification-progress.json', 'verification.json', 'activation.json', 'native-acceptance.json', 'atlas-deployment.json', 'workspace-acceptance.json', 'completion.json', 'attachment-recovery-progress.json', 'attachment-recovery.json']:
+        for name in ['verification-progress.json', 'verification.json', 'activation.json', 'native-acceptance.json', 'atlas-deployment.json', 'workspace-acceptance.json', 'completion.json', 'attachment-recovery-progress.json', 'attachment-recovery.json', 'tool-verification.json', 'tool-installation.json']:
             p = root / 'evidence' / name
             if p.is_file():
                 result[name] = json.loads(p.read_text())

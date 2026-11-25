@@ -35,6 +35,7 @@ export async function mountCodexMigration(host, {api, toast}) {
         ['工程与 Git',plan.workspace_acceptance?.status==='passed'],['目标 Atlas',plan.atlas_deployment?.status==='running']
       ].map(([label,ok])=>`<span class="badge">${ok?'✓':'○'} ${label}${ok?' 已通过':' 待验证'}</span>`).join('')}</div>
       ${plan.native_acceptance?`<p>原生读取 ${Number(plan.native_acceptance.read_threads||0)} 条会话 · 保留目标原有 ${Number(plan.native_acceptance.preserved_target_threads||0)} 条 · 历史分页验证 ${Number(plan.native_acceptance.history_samples?.length||0)} 条</p>`:''}
+      ${plan.tool_supplement?`<p>用户工具运行环境：${Number(plan.tool_supplement.entries||0).toLocaleString()} 项 · ${size(plan.tool_supplement.bytes)} · ${plan.tool_supplement.status==='passed'?'目标运行验收通过':'文件已校验，待目标运行验收'}</p>`:''}
       ${plan.activation?.attachments?`<p>历史图片：从原始上下文恢复 ${Number(plan.activation.attachments.recovered_paths)} 个路径 · 源机缺失且仍无法恢复的用户图片 ${Number(plan.activation.attachments.unresolved_user_images)} 个。原始对话日志继续保留。</p>`:''}
       ${plan.workspace_acceptance?`<p>Git 仓库 ${Number(plan.workspace_acceptance.repositories?.length||0)} 个 · 缺失工程目录 ${Number(plan.workspace_acceptance.missing_thread_workspaces?.length||0)} 个 · Git 问题 ${Number(plan.workspace_acceptance.git_errors?.length||0)} 项。项目构建与设备连接另行验收。</p>`:''}
       ${plan.atlas_deployment?`<p>目标本机入口：<code>${esc(plan.atlas_deployment.local_url_on_target)}</code> · 此地址在目标设备上访问。</p>`:''}
