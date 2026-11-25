@@ -71,3 +71,30 @@ def complete(ident: str):
 @router.post('/api/codex-migrations/{ident}/recover-worktree')
 def recover_worktree(ident: str, body: dict):
     return migration.recover_worktree(ident, body['thread_id'], body['repository'])
+
+
+@router.post('/api/codex-migrations/{ident}/prepare-history')
+def prepare_history(ident: str):
+    return migration.maintain_history(ident,'prepare_history')
+
+
+@router.post('/api/codex-migrations/{ident}/verify-history')
+def verify_history(ident: str):
+    return migration.maintain_history(ident,'verify_history')
+
+
+@router.post('/api/codex-migrations/{ident}/install-history')
+def install_history(ident: str, body: dict):
+    if body.get('reviewed_plan_id') != ident or not body.get('allow_app_restart'):
+        raise ValueError('请核对历史修复报告并允许目标正常重启')
+    return migration.maintain_history(ident,'install_history')
+
+
+@router.post('/api/codex-migrations/{ident}/capture-finished')
+def capture_finished(ident: str):
+    return migration.capture_finished_history(ident)
+
+
+@router.post('/api/codex-migrations/{ident}/apply-finished')
+def apply_finished(ident: str):
+    return migration.apply_finished_history(ident)

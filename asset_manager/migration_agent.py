@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import sqlite3
 import stat
@@ -640,54 +641,246 @@ def activate(body):
 
 
 def repair_active_paths(body):
-    """Maintenance for an already activated profile, with a preserved rollback."""
+    """The legacy in-place path mutation cannot provide isolated acceptance."""
+    raise ValueError('旧版原位路径修复已停用；请依次使用 prepare-history、verify-history、install-history，切换前先完成隔离验收')
+
+
+def history_maintenance(body):
+    if body['action'] in {'history_coverage','prepare_finished'}:
+        return _history_maintenance(body)
+    import fcntl
+    root=checked_root(body['root'])
+    with (root/'evidence/history-maintenance.lock').open('a') as lock:
+        try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:raise ValueError('已有历史维护任务进行中，请等待完成')
+        return _history_maintenance(body)
+
+
+def _history_maintenance(body):
+    """Prepare, validate and install history repairs without replacing user data."""
     import atlas_codex_profile as profile
+    history = profile.history_module()
     root = checked_root(body['root'])
-    activation = json.loads((root / 'evidence/activation.json').read_text())
-    if activation['status'] not in {'activated_pending_acceptance', 'accepted'} or not body.get('allow_app_restart'):
-        raise ValueError('路径维护需要已激活的迁移与目标重启授权')
-    if sys.platform != 'darwin':
-        raise ValueError('当前自动退出与重启仅支持 macOS')
+    marker = json.loads((root / 'ATLAS-MIGRATION.json').read_text())
+    if marker['id'] != body['id']:
+        raise ValueError('迁移任务标识不一致')
     current = Path.home() / '.codex'
-    with profile.connection(current / 'thread_history_1.sqlite') as c:
-        if c.execute("SELECT count(*) FROM thread_turns WHERE status NOT IN ('completed','interrupted','failed') AND completed_at IS NULL").fetchone()[0]:
-            raise ValueError('目标仍有活动会话，暂不修改')
-    reopened = []
+    action = body['action']
+    receipt_path = root / 'evidence/history-maintenance.json'
+    names = ['state_5.sqlite', 'thread_history_1.sqlite']
+    if action=='history_coverage':
+        return history.terminal_coverage(current)
+    if action=='prepare_finished':
+        ident=body['delta_id']
+        if not re.fullmatch('[a-f0-9]{32}',ident):raise ValueError('尾差标识无效')
+        path=root/'finished-history'/ident
+        path.mkdir(parents=True,exist_ok=False,mode=0o700)
+        return {'path':str(path)}
+    if action == 'prepare_history':
+        with profile.connection(current / 'thread_history_1.sqlite') as c:
+            if c.execute("SELECT count(*) FROM thread_turns WHERE status NOT IN ('completed','failed','interrupted')").fetchone()[0]:
+                raise ValueError('目标仍有活动会话，不能准备历史修复')
+        runroot = root / 'history-maintenance' / uuid.uuid4().hex
+        before, staged = runroot / 'before', runroot / 'profile'
+        before.mkdir(parents=True); staged.mkdir()
+        report = {'status': 'preparing', 'schema_version': 1, 'run_root': str(runroot),
+                  'source_home': marker['source_home'], 'target_home': str(Path.home()),
+                  'log_signature': history.log_signature(current), 'log_signature_schema':2, 'baseline': {}, 'source_deleted': False}
+        atomic_json(receipt_path, report)
+        for name in names:
+            profile.backup(current / name, before / name)
+            report['baseline'][name] = profile.persistent_signature(before / name, profile.DATABASE_TABLES[name])
+            profile.clone(before / name, staged / name)
+        for name in ['sessions', 'archived_sessions']:
+            if (current / name).exists():
+                profile.clone(current / name, staged / name)
+        for name in ['config.toml', 'auth.json']:
+            if (current / name).is_file() and not (current / name).is_symlink():
+                profile.clone(current / name, staged / name)
+        if history.log_signature(current) != report['log_signature']:
+            raise ValueError('目标日志在准备期间变化，需重新准备')
+        aliases = {}
+        recovery = root / 'evidence/attachment-recovery.json'
+        if recovery.exists():
+            aliases.update(json.loads(recovery.read_text()).get('aliases', {}))
+        report['item_path_repairs'] = history.repair_item_paths(staged, marker['source_home'], str(Path.home()), aliases)
+        report['rollout_repairs'] = profile.repair_rollout_metadata(staged, marker['source_home'], str(Path.home()))
+        if report['rollout_repairs']['status'] != 'prepared':
+            raise ValueError('日志存在未处理记录，禁止激活')
+        report['preservation'] = history.preservation(before, staged, marker['source_home'], str(Path.home()), aliases)
+        if report['preservation']['status'] != 'passed':
+            raise ValueError('目标原有历史保护检查失败')
+        with sqlite3.connect(staged / 'state_5.sqlite') as c:
+            for ident, path in c.execute('SELECT id,rollout_path FROM threads').fetchall():
+                mapped = profile.map_path(path, str(current), str(staged))
+                if mapped != path:
+                    c.execute('UPDATE threads SET rollout_path=? WHERE id=?', (mapped, ident))
+        report.update(status='prepared', prepared_at=time.time())
+        atomic_json(receipt_path, report)
+        return report
+    report = json.loads(receipt_path.read_text())
+    runroot = Path(report['run_root'])
+    if not runroot.resolve().is_relative_to((root / 'history-maintenance').resolve()):
+        raise ValueError('修复暂存目录越界')
+    staged = runroot / 'profile'
+    def restore_delta(preservation):
+        if not preservation.resolve().is_relative_to(runroot.resolve()):raise ValueError('尾差恢复目录越界')
+        failed=runroot/('failed-delta-'+uuid.uuid4().hex);failed.mkdir()
+        for name in ['state_5.sqlite','thread_history_1.sqlite','sessions','archived_sessions']:
+            if (staged/name).exists():os.rename(staged/name,failed/name)
+            if (preservation/name).exists():profile.clone(preservation/name,staged/name)
+            if name.endswith('.sqlite'):
+                for suffix in ['-wal','-shm']:
+                    path=staged/(name+suffix)
+                    if path.exists():os.rename(path,failed/path.name)
+        return str(failed)
+    if action=='rollback_finished':
+        if report['status']!='delta_failed':raise ValueError('没有失败尾差需要恢复')
+        report['failed_delta_preserved']=restore_delta(Path(report['delta_rollback']))
+        report['status']='prepared';atomic_json(receipt_path,report)
+        return report
+    if action=='merge_finished':
+        if report['status'] not in {'prepared','validated','validation_failed'}:
+            raise ValueError('请先准备历史修复副本')
+        ident=body['delta_id']
+        if not re.fullmatch('[a-f0-9]{32}',ident):raise ValueError('尾差标识无效')
+        package=root/'finished-history'/ident
+        if digest(package/'manifest.json')!=body['manifest_sha256']:
+            raise ValueError('尾差清单校验失败')
+        preservation=runroot/('before-delta-'+ident+'-'+uuid.uuid4().hex)
+        preservation.mkdir()
+        for name in ['state_5.sqlite','thread_history_1.sqlite','sessions','archived_sessions']:
+            if (staged/name).is_file() and name.endswith('.sqlite'):
+                profile.backup(staged/name,preservation/name)
+            elif (staged/name).exists():profile.clone(staged/name,preservation/name)
+        aliases={}
+        recovery=root/'evidence/attachment-recovery.json'
+        if recovery.exists():aliases=json.loads(recovery.read_text()).get('aliases',{})
+        try:
+            delta=history.merge_finished(staged,package,str(Path.home()),aliases)
+        except BaseException as exc:
+            # A failed multi-file merge cannot become an installable profile.
+            report.update(status='delta_failed',delta_rollback=str(preservation),last_delta_error=str(exc))
+            atomic_json(receipt_path,report)
+            report['failed_delta_preserved']=restore_delta(preservation)
+            report['status']='prepared'
+            atomic_json(receipt_path,report)
+            raise
+        report.setdefault('finished_deltas',[]).append({'id':ident,**delta})
+        report.update(status='prepared',delta_prepared_at=time.time())
+        atomic_json(receipt_path,report)
+        return report
+    if action == 'repair_history_stage':
+        if report['status'] not in {'prepared','validation_failed'}:
+            raise ValueError('当前阶段不能刷新隔离修复')
+        report['rollout_repairs']=profile.repair_rollout_metadata(staged,marker['source_home'],str(Path.home()))
+        report.update(status='prepared',refreshed_at=time.time())
+        atomic_json(receipt_path,report)
+        return report
+    if action == 'verify_history':
+        if report['status'] not in {'prepared', 'validated', 'validation_failed'}:
+            raise ValueError('请先准备历史修复副本')
+        with profile.connection(staged / 'state_5.sqlite') as c:
+            ids = [r[0] for r in c.execute('SELECT id FROM threads')]
+        result = profile.native_acceptance(staged, runroot, ids, [], full=True)
+        atomic_json(runroot / 'native-acceptance.json', result)
+        report.update(status='validated' if result['status'] == 'passed' else 'validation_failed',
+                      native_status=result['status'], validated_at=time.time(),
+                      full_history=result.get('full_history'), offsets=result.get('offsets'))
+        # Full reports stay in the run directory; the receipt is intentionally bounded.
+        report['full_history'] = {k:v for k,v in (result.get('full_history') or {}).items() if k!='threads'}
+        report['offsets'] = {k:v for k,v in (result.get('offsets') or {}).items() if k!='branches'}
+        atomic_json(receipt_path, report)
+        return report
+    if action != 'install_history' or report['status'] != 'validated' or not body.get('allow_app_restart'):
+        raise ValueError('历史修复尚未通过隔离验收，或未允许目标重启')
+    if sys.platform != 'darwin':
+        raise ValueError('当前自动桌面切换仅支持 macOS')
+    reopened, moved = [], []
+    rollback = runroot / 'rollback'; rollback.mkdir(exist_ok=True)
+    if any(rollback.iterdir()):raise ValueError('已有切换前副本，拒绝覆盖')
     try:
-        processes = run(['ps', '-axo', 'comm='])
-        for name in ['ChatGPT', 'Codex']:
-            if '/Applications/' + name + '.app/Contents/MacOS/' in processes:
-                result = subprocess.run(['osascript', '-e', 'tell application "' + name + '" to quit'], capture_output=True, timeout=30)
+        with profile.connection(current / 'thread_history_1.sqlite') as c:
+            if c.execute("SELECT count(*) FROM thread_turns WHERE status NOT IN ('completed','failed','interrupted')").fetchone()[0]:
+                raise ValueError('目标出现活动会话，保持当前环境')
+        processes = run(['ps','-axo','comm='])
+        for app in ['ChatGPT','Codex']:
+            if '/Applications/' + app + '.app/Contents/MacOS/' in processes:
+                result = subprocess.run(['osascript','-e','tell application "'+app+'" to quit'],capture_output=True,timeout=30)
                 if result.returncode:
                     raise ValueError('目标应用未正常退出')
-                reopened.append(name)
-            cli = Path('/Applications') / (name + '.app/Contents/Resources/codex-cli/bin/codex')
-            if cli.is_file():
-                subprocess.run([str(cli), 'app-server', 'daemon', 'stop'], capture_output=True, timeout=30)
+                reopened.append(app)
+            cli = Path('/Applications') / (app+'.app/Contents/Resources/codex-cli/bin/codex')
+            if cli.exists():
+                subprocess.run([str(cli),'app-server','daemon','stop'],capture_output=True,timeout=30)
         for _ in range(30):
-            processes = run(['ps', '-axo', 'comm='])
-            if not any('/Applications/' + name + '.app/' in line and ('/codex' in line or line.endswith('/MacOS/' + name))
-                       for line in processes.splitlines() for name in ['ChatGPT', 'Codex']):
+            processes = run(['ps','-axo','comm='])
+            if not any('/Applications/'+app+'.app/' in line and ('/codex' in line or line.endswith('/MacOS/'+app))
+                       for app in ['ChatGPT','Codex'] for line in processes.splitlines()):
                 break
             time.sleep(1)
         else:
-            raise ValueError('目标仍有 Codex 写入进程')
-        preserved = root / 'path-repair-history' / uuid.uuid4().hex
-        preserved.mkdir(parents=True)
-        profile.backup(current / 'state_5.sqlite', preserved / 'state_5.sqlite')
-        for name in ['sessions', 'archived_sessions']:
-            if (current / name).exists():
-                profile.clone(current / name, preserved / name)
-        source_home = json.loads((root / 'ATLAS-MIGRATION.json').read_text())['source_home']
-        result = profile.repair_rollout_metadata(current, source_home, str(Path.home()))
-        result['previous_profile_paths'] = str(preserved)
-        atomic_json(root / 'evidence/rollout-path-rebinding.json', result)
-        activation.update(status='activated_pending_acceptance', rollout_paths=result)
-        atomic_json(root / 'evidence/activation.json', activation)
-        return result
+            raise ValueError('目标写入进程未退出')
+        for name in names:
+            if profile.persistent_signature(current/name, profile.DATABASE_TABLES[name]) != report['baseline'][name]:
+                raise ValueError('目标准备后有新内容，拒绝覆盖：'+name)
+        if report.get('log_signature_schema',1)<2:
+            report['log_signature'],report['guard_upgrade']=history.upgrade_compressed_guard(report['log_signature'],current,runroot)
+            report['log_signature_schema']=2
+            atomic_json(receipt_path,report)
+        if history.log_signature(current) != report['log_signature']:
+            raise ValueError('目标日志准备后变化，拒绝覆盖')
+        with sqlite3.connect(staged/'thread_history_1.sqlite') as c:
+            if c.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()[0]:
+                raise ValueError('暂存数据库仍有写入者')
+            c.execute('PRAGMA journal_mode=DELETE')
+        # Keep current state metadata (read receipts, titles, settings) intact.
+        # Only history and its physical logs need replacement for this repair.
+        # Apply only explicitly captured source branch selections to state;
+        # ignore incidental metadata written by isolated native verification.
+        install_names=['thread_history_1.sqlite','sessions','archived_sessions']
+        if report.get('finished_deltas'):
+            replacement=runroot/'state-to-install.sqlite'
+            profile.backup(current/'state_5.sqlite',replacement)
+            with sqlite3.connect(replacement) as c:
+                for delta in report['finished_deltas']:
+                    for logical,relative in delta['state_paths'].items():
+                        c.execute('UPDATE threads SET rollout_path=? WHERE id=?',(str(current/relative),logical))
+            # The validated profile retains its native-validation state as evidence.
+            os.rename(staged/'state_5.sqlite',runroot/'state-after-native-validation.sqlite')
+            os.rename(replacement,staged/'state_5.sqlite')
+            install_names.insert(0,'state_5.sqlite')
+        for name in install_names:
+            if not (staged/name).exists():
+                continue
+            if (current/name).exists():
+                os.rename(current/name,rollback/name)
+            moved.append(name)
+            os.rename(staged/name,current/name)
+        for dbname in [n for n in install_names if n.endswith('.sqlite')]:
+            for suffix in ['-wal','-shm']:
+                path = current/(dbname+suffix)
+                if path.exists():os.rename(path,rollback/path.name)
+        report.update(status='installed', installed_at=time.time(), rollback=str(rollback), restarted_apps=reopened)
+        atomic_json(receipt_path,report)
+        activation=json.loads((root/'evidence/activation.json').read_text())
+        activation['status']='activated_pending_acceptance'
+        atomic_json(root/'evidence/activation.json',activation)
+        return report
+    except BaseException:
+        for name in reversed(moved):
+            if (current/name).exists():
+                os.rename(current/name,staged/name)
+            if (rollback/name).exists():
+                os.rename(rollback/name,current/name)
+        for dbname in ['state_5.sqlite','thread_history_1.sqlite']:
+            for suffix in ['-wal','-shm']:
+                path=rollback/(dbname+suffix)
+                if path.exists():os.rename(path,current/path.name)
+        raise
     finally:
-        for name in reopened:
-            subprocess.run(['open', '-a', name], capture_output=True, timeout=20)
+        for app in reopened:
+            subprocess.run(['open','-a',app],capture_output=True,timeout=20)
 
 
 def accept_native(body):
@@ -703,7 +896,7 @@ def accept_native(body):
         with profile.connection(path) as c:
             return [r[0] for r in c.execute('SELECT id FROM threads')]
     result = profile.native_acceptance(Path.home() / '.codex', root / 'evidence',
-        ids(root / 'incoming/.codex/state_5.sqlite'), ids(root / 'destination-original-codex/state_5.sqlite'))
+        ids(root / 'incoming/.codex/state_5.sqlite'), ids(root / 'destination-original-codex/state_5.sqlite'), full=True)
     if (root / 'evidence/python-runtime-rebinding.json').exists():
         result['python_runtimes'] = runtime_tools.verify_python_links(root, Path.home(), sys.modules[__name__])
         if result['python_runtimes']['status'] != 'passed':
@@ -838,6 +1031,8 @@ def main():
         result = accept_native(body)
     elif action == 'repair_active_paths':
         result = repair_active_paths(body)
+    elif action in {'prepare_history','verify_history','install_history','repair_history_stage','history_coverage','prepare_finished','merge_finished','rollback_finished'}:
+        result = history_maintenance(body)
     elif action == 'probe_native':
         import atlas_codex_profile as profile
         root = checked_root(body['root'])
@@ -903,9 +1098,16 @@ def main():
                   for name in ['verification.json', 'native-acceptance.json', 'workspace-acceptance.json']}
         if any(r['status'] != 'passed' for r in checks.values()):
             raise ValueError('仍有验收未通过')
+        native = checks['native-acceptance.json']
+        if (native.get('full_history') or {}).get('status') != 'passed' or (native.get('offsets') or {}).get('status') != 'passed':
+            raise ValueError('缺少全量历史字段与日志偏移验收，旧版抽样报告不能完成迁移')
+        boundary=body.get('finished_history_acceptance',{})
+        if boundary.get('status')!='passed':raise ValueError('需要来源已结束轮次的最终差异检查')
+        atomic_json(root/'evidence/finished-history-acceptance.json',boundary)
         result = {'status': 'complete', 'checks': {k: r['status'] for k, r in checks.items()},
                   'source_deleted': False, 'completed_at': time.time(),
-                  'project_builds_executed': False, 'original_snapshots_retained': True}
+                  'project_builds_executed': False, 'original_snapshots_retained': True,
+                  'finished_history_acceptance':boundary,'scope':'verified_workspace_snapshot_and_captured_closed_history'}
         atomic_json(root / 'evidence/completion.json', result)
         power = root / 'evidence/power-assertion.json'
         if power.exists():
@@ -930,7 +1132,7 @@ def main():
     elif action == 'report':
         root = checked_root(body['root'])
         result = {}
-        for name in ['verification-progress.json', 'verification.json', 'activation.json', 'native-acceptance.json', 'atlas-deployment.json', 'workspace-acceptance.json', 'completion.json', 'attachment-recovery-progress.json', 'attachment-recovery.json', 'tool-verification.json', 'tool-installation.json', 'python-runtime-rebinding.json', 'python-runtime-acceptance.json', 'rollout-path-rebinding.json']:
+        for name in ['verification-progress.json', 'verification.json', 'activation.json', 'native-acceptance.json', 'atlas-deployment.json', 'workspace-acceptance.json', 'completion.json', 'attachment-recovery-progress.json', 'attachment-recovery.json', 'tool-verification.json', 'tool-installation.json', 'python-runtime-rebinding.json', 'python-runtime-acceptance.json', 'rollout-path-rebinding.json','history-maintenance.json','finished-history-acceptance.json']:
             p = root / 'evidence' / name
             if p.is_file():
                 result[name] = json.loads(p.read_text())

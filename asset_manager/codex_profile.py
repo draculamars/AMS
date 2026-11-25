@@ -34,6 +34,13 @@ PATH_KEYS = {'cwd', 'path', 'root', 'roots', 'writable_roots', 'image_path', 'fi
              'writableRoots', 'filePath', 'localPath', 'common_dir', 'checkout_root', 'repo_root'}
 
 
+def history_module():
+    module = sys.modules.get('atlas_codex_history')
+    if module is None:
+        from . import codex_history as module
+    return module
+
+
 def map_path(value, source_home, target_home):
     if isinstance(value, str) and (value == source_home or value.startswith(source_home + '/')):
         return target_home + value[len(source_home):]
@@ -41,13 +48,7 @@ def map_path(value, source_home, target_home):
 
 
 def map_json_paths(value, source_home, target_home, key=''):
-    if isinstance(value, dict):
-        return {k: map_json_paths(v, source_home, target_home, k) for k, v in value.items()}
-    if isinstance(value, list):
-        return [map_json_paths(v, source_home, target_home, key) for v in value]
-    if key in PATH_KEYS:
-        return map_path(value, source_home, target_home)
-    return value
+    return history_module().mapped_paths(value, source_home, target_home, key=key)
 
 
 def load_toml(path):
@@ -289,6 +290,7 @@ def repair_rollout_metadata(codex_home, source_home, target_home, max_record_byt
     """
     import re
     codex_home = Path(codex_home)
+    compressed = history_module().expand_compressed(codex_home, codex_home.parent / ('compressed-originals-' + uuid.uuid4().hex))
     changed, warnings = [], []
     for directory in ['sessions', 'archived_sessions']:
         for path in sorted((codex_home / directory).rglob('*.jsonl')):
@@ -317,10 +319,10 @@ def repair_rollout_metadata(codex_home, source_home, target_home, max_record_byt
                             continue
                         # Only the top-level discriminator near the start is
                         # eligible. Message/tool bodies are never rewritten.
-                        if re.search(rb'"type"\s*:\s*"(?:session_meta|turn_context)"', raw[:256]):
+                        if re.search(rb'"type"\s*:\s*"(?:session_meta|turn_context|event_msg)"', raw[:256]):
                             try:
                                 record = json.loads(raw)
-                                if record.get('type') in {'session_meta', 'turn_context'}:
+                                if record.get('type') in {'session_meta', 'turn_context', 'event_msg'}:
                                     mapped = map_json_paths(record.get('payload'), source_home, target_home)
                                     if mapped != record.get('payload'):
                                         record['payload'] = mapped
@@ -341,9 +343,10 @@ def repair_rollout_metadata(codex_home, source_home, target_home, max_record_byt
         mapped_rows = [(map_path(cwd, source_home, target_home), map_path(rollout, source_home, target_home), ident)
                       for ident, cwd, rollout in rows if map_path(cwd, source_home, target_home) != cwd or map_path(rollout, source_home, target_home) != rollout]
         c.executemany('UPDATE threads SET cwd=?,rollout_path=? WHERE id=?', mapped_rows)
-    return {'status': 'prepared' if not warnings else 'needs_attention', 'files': changed,
+    offsets = history_module().repair_offsets(codex_home) if (codex_home / 'thread_history_1.sqlite').exists() else None
+    return {'status': 'prepared' if not warnings else 'needs_attention', 'files': changed, 'offsets': offsets, 'compressed_logs': compressed,
             'state_rows': len(mapped_rows), 'warnings': warnings, 'historical_message_bytes_preserved': True,
-            'scope': 'session_meta_turn_context_and_state_paths', 'checked_at': time.time()}
+            'scope': 'typed_paths_and_ordinal_derived_byte_offsets', 'checked_at': time.time()}
 
 
 def repair_references(roots, source_home, target_home):
@@ -489,7 +492,7 @@ class NativeCodex:
             if not data:
                 raise ValueError('原生 Codex 验证连接关闭')
             self.buffer += data
-            if len(self.buffer) > 16 * 1024**2:
+            if len(self.buffer) > 64 * 1024**2:
                 raise ValueError('原生响应超过本次元数据验收的内存上限')
         raise ValueError('原生 Codex 请求超时：' + method)
 
@@ -504,7 +507,7 @@ class NativeCodex:
         self.log.close()
 
 
-def native_acceptance(codex_home, evidence, source_ids, destination_ids):
+def native_acceptance(codex_home, evidence, source_ids, destination_ids, full=False):
     codex_home, evidence = Path(codex_home), Path(evidence)
     candidates = [Path('/Applications') / (app + '.app/Contents/Resources/codex-cli/bin/codex') for app in ['ChatGPT', 'Codex']]
     found = shutil.which('codex')
@@ -600,7 +603,21 @@ def native_acceptance(codex_home, evidence, source_ids, destination_ids):
                 errors.append({'component': 'resume_or_skills', 'error': str(exc)})
         elif source_ids:
             errors.append({'component': 'resume', 'error': '没有可接续的迁入工程目录'})
+        comprehensive, offsets = None, None
+        if full:
+            def progress(value):
+                path = evidence / 'history-validation-progress.json'
+                temporary = path.with_suffix('.tmp')
+                temporary.write_text(json.dumps({**value, 'updated_at': time.time()}))
+                temporary.chmod(0o600)
+                os.replace(temporary, path)
+            comprehensive = history_module().native_full_history(client, codex_home, progress)
+            offsets = history_module().offset_plan(codex_home)
+            orphan_history = comprehensive['unregistered_history_ids']
+            if comprehensive['status'] != 'passed' or offsets['status'] != 'passed':
+                errors.append({'component': 'full_history', 'error': '全量原生字段或日志偏移校验未通过'})
         return {'status': 'passed' if not missing and not errors else 'failed',
+                'full_history': comprehensive, 'offsets': offsets,
                 'source_threads': len(source_ids), 'preserved_target_threads': len(destination_ids),
                 'listed_threads': len(listed), 'read_threads': len(checked), 'missing_ids': missing,
                 'attached_threads': len(expected & attached),

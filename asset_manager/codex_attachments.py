@@ -37,29 +37,13 @@ def references(database):
 
 
 def relocate_item(item, source_home, target_home, aliases=None):
-    def path(value):
-        if value in (aliases or {}):
-            return aliases[value]
-        if isinstance(value, str) and value.startswith(source_home + '/'):
-            return target_home + value[len(source_home):]
-        return value
-    result = copy.deepcopy(item)
-    kind = result.get('type')
-    if kind == 'userMessage':
-        for part in result.get('content', []):
-            if part.get('type') == 'localImage' and part.get('path'):
-                part['path'] = path(part['path'])
-    elif kind == 'imageView' and result.get('path'):
-        result['path'] = path(result['path'])
-    elif kind == 'commandExecution':
-        for key in ['cwd', 'scriptPath']:
-            if result.get(key):
-                result[key] = path(result[key])
-    elif kind == 'fileChange':
-        for change in result.get('changes', []):
-            if change.get('path'):
-                change['path'] = path(change['path'])
-    return result
+    if item.get('type') not in {'userMessage','imageView','fileChange','commandExecution'}:
+        return copy.deepcopy(item)
+    import sys
+    history = sys.modules.get('atlas_codex_history')
+    if history is None:
+        from . import codex_history as history
+    return history.mapped_paths(item, source_home, target_home, aliases)
 
 
 def embedded_images(record):

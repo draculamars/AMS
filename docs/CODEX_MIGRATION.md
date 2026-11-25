@@ -1,5 +1,37 @@
 # Codex 跨机迁移
 
+## 0.7.0-migration.2 的完成边界
+
+完成验收针对明确捕获的工程快照和已结束轮次。源机继续运行时，未来回复、执行进度和新文件不会因为之前的 SHA-256 通过而自动成为已迁入内容。完成操作现在重新比较两端的已结束轮次；发现新增结束内容会阻止完成，并要求补同步。捕获时仍在进行的轮次单独列出，不能把它们伪装成已完成。
+
+接收 Python 需要安装 `requirements.lock`（包含 `zstandard`）。已有 Atlas 的目标可在方案中用 `remote_python` 指向其虚拟环境解释器；该路径必须是绝对路径。SSH 地址变动可设置 `host_key_alias` 保留已验证的主机身份，不会关闭主机密钥检查。
+
+### 已迁入环境的一致性修复
+
+网页依次提供“准备历史一致性修复”“捕获已结束会话的补同步内容”“合入隔离副本并检查冲突”“全量验证隔离副本”“保留当前副本，重启目标并接入修复”。CLI 共用这些实现：
+
+```bash
+python -m asset_manager.codex_migration prepare-history TASK_ID
+python -m asset_manager.codex_migration capture-finished TASK_ID
+python -m asset_manager.codex_migration apply-finished TASK_ID
+python -m asset_manager.codex_migration verify-history TASK_ID
+python -m asset_manager.codex_migration install-history TASK_ID
+python -m asset_manager.codex_migration verify-native TASK_ID
+python -m asset_manager.codex_migration verify-workspaces TASK_ID
+python -m asset_manager.codex_migration complete TASK_ID
+```
+
+- 原始 `incoming` 不变；新副本和切换前数据保存在 `history-maintenance/<运行 ID>/`。
+- `.jsonl` 与 `.jsonl.zst` 都参与分支发现。压缩原件保存在独立目录，工作副本展开后才修改。
+- 对每个实际记录重新计算位置，同时检查轮次起止、投影游标以及 `history_base.end_byte_offset`。父历史边界用记录序号绑定，不能沿用改写前的字节地址。
+- 分支沿 `history_base` 递归展开，并遵循 `end_ordinal_exclusive`。附属聊天的继承上下文不重复计入其可见聊天；来源保留的空中断占位记录有独立说明，不删除。
+- 原生验收逐页核对所有可见轮次 ID、结束状态、结束时间、内容 ID 及每一个保存字段。不同版本新增的字段可以保留，来源字段不允许静默改变。
+- 已结束会话补同步在同一只读数据库事务中选取轮次，以该轮次结束位置截断日志。目标新增设置保留；目标独立对话内容或已结束内容与来源不同则拒绝覆盖。
+- 准备阶段逐字段核对目标原有历史。切换前正常退出目标应用，重新检查数据库与日志是否变化，存在新内容就拒绝覆盖。任一切换失败恢复旧目录和 WAL 文件。
+- 补同步的是聊天历史。工程文件仍按工程快照及单独的变更交付验收；聊天中出现新文件路径不等于对应工程内容已经更新。每个实际任务需单列其工程补交付范围。
+
+`native-acceptance.json` 中 `full_history` 和 `offsets` 必须通过，旧版 `history_samples` 抽样通过不足以完成迁移。压缩与普通历史中的来源缺口、保留的上下文占位和未结束轮次分别报告。数据库保留、原生可见内容、工程可运行性是不同验收范围。
+
 Atlas 的“Codex 迁移”入口位于 `#codex-migration`。它将工作目录、Git、会话数据库、持久化记忆、技能和插件资源一起迁移，分别记录复制、校验、接续与原生读取验收。来源文件始终保留。
 
 本适配器检查实际 SQLite schema，并使用目标安装的 Codex App Server 验收。它是 Atlas 的适配器，不是 OpenAI 官方导入接口。当前原生桌面切换适配 macOS；SSH 文件接收器支持 macOS/Linux。Windows Atlas 原有功能不变，当前迁移执行器仍需要本机 SSH、rsync 与受支持的 Python 运行时。
@@ -35,7 +67,7 @@ Atlas 的“Codex 迁移”入口位于 `#codex-migration`。它将工作目录�
 6. 清单外的中断残留移到任务证据区保留，不带入激活快照。内容校验失败时禁止接续。
 7. 先检查历史图片：恢复副本只调整结构化的附件路径；历史文本和工具参数原文保留，嵌入图像不保证原图分辨率。随后在副本中合并会话、项目和记忆。UUID 内容冲突、数据库谱系不兼容、同名目标工程会阻止切换，原件保留。
 8. 接续时正常退出目标 Codex，检查活动会话和准备后变化，切换已准备目录，再重启。源机应用不停止；切换失败时恢复已移动目录。
-9. 用目标原生 thread/list、thread/read、thread/turns/list 逐会话验证，并选取一个迁入会话执行不含新轮次的 thread/resume 和 skills/list。子代理与附属会话按各自父会话查询并验证，不要求出现在顶层列表。历史库中已没有活动会话索引的记录仍保留，但单列为归档，不伪造新会话，也不计入原生可用验收。验收不发送提示、不启动模型轮次。
+9. 用目标原生 thread/list、thread/read、thread/turns/list、thread/items/list 验证全部可见轮次与内容字段，并选取一个迁入会话执行不含新轮次的 thread/resume 和 skills/list。子代理与附属会话按各自父会话查询并验证，不要求出现在顶层列表。历史分支通过普通或压缩日志的 history_base 关联到实际聊天，不因分支 ID 不在 threads 表中就判定为未注册；无法关联的记录才单列缺口。验收不发送提示、不启动模型轮次。
    数据库有记录而原生接口返回空历史、接续返回错误工作目录或技能发现缺少该目录，均视为未通过。
 10. 校验工程目录与 Git HEAD、refs、对象完整性。源机已经缺失的历史工作树可按会话记录的提交，在目标重建 detached 工作树；报告明确其不能恢复源机已经丢失的未提交内容。
    源机已不存在、未注册为工程且位于临时目录的历史测试 cwd 单独列为来源缺口，不建立空目录冒充工程；其他缺失工程仍阻止完成验收。
@@ -63,7 +95,7 @@ Atlas 的“Codex 迁移”入口位于 `#codex-migration`。它将工作目录�
 
 SSH 加密传输；目标是可直接访问的普通文件，不额外加密归档。控制文件使用 0600。来源登录文件不迁移，但所选工程内的 `.env`、私有文档、工具配置仍可能包含敏感内容，不应公开发布迁移目录。
 
-macOS openrsync 的 `-E` 对只读 Git 对象和重命名单文件存在兼容问题，所以文件传输与扩展属性恢复分开进行，不修改来源 Git 对象权限。原始快照和接续副本分别保存；历史对话正文不做全局字符串替换。接续副本只重绑定 JSONL 的 session_meta、turn_context 路径字段与数据库路径，避免应用重建索引时恢复旧用户名路径。原始 JSONL 保留在 incoming。
+macOS openrsync 的 `-E` 对只读 Git 对象和重命名单文件存在兼容问题，所以文件传输与扩展属性恢复分开进行，不修改来源 Git 对象权限。原始快照和接续副本分别保存；历史对话正文不做全局字符串替换。接续副本重绑定 JSONL 元数据、事件中的结构化路径与数据库路径，同时重建 SQLite 和 history_base 的字节位置，避免应用重建索引时恢复旧用户名路径。原始 JSONL 保留在 incoming。
 
 ## CLI 与运维
 
@@ -103,4 +135,4 @@ python -m asset_manager.codex_migration complete TASK_ID
 
 原生验收同时检查受修复环境的启动、版本、环境前缀、SSL 与 SQLite；这不代替逐工程依赖、编译和硬件验收。`python-runtime-rebinding.json` 与 `python-runtime-acceptance.json` 分别记录修改与运行结果。已准备但未激活时可运行 `repair-runtimes TASK_ID`；已激活的补充工具只允许复验本任务拥有的安装记录。NVM 使用已记录的默认版本，避免后台服务 PATH 选择来源其他 Node 版本。
 
-已激活的旧任务若发现索引被旧日志路径覆盖，可运行 `repair-paths TASK_ID`：检查目标没有活动轮次，正常退出并重启目标 Codex，保存维护前数据库与日志副本，再修复结构化元数据；之后必须重新完成原生与工程验收。
+已激活的旧任务须使用下述隔离准备、全量验收、切换流程。旧版 `repair-paths` 原位修改入口已停用，避免未经验证直接改变活动数据库和日志。

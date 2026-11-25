@@ -23,7 +23,7 @@ import time
 import uuid
 import zlib
 from pathlib import Path
-from . import db, migration_agent as agent, codex_profile, codex_attachments, migration_tools
+from . import db, migration_agent as agent, codex_profile, codex_attachments, migration_tools, codex_history
 
 CODEx_TRANSIENT = {'ipc', 'tmp', '.tmp', 'app-server-control', 'thread-writer-locks',
                    'project-metadata-locks', 'process_manager', 'shell_snapshots',
@@ -57,6 +57,16 @@ def save(plan, **updates):
     agent.atomic_json(folder(plan['id']) / 'plan.json', plan)
 
 
+def patch_plan(ident, **updates):
+    """Progress must not overwrite a concurrently completed acceptance receipt."""
+    import fcntl
+    with (folder(ident)/'plan-update.lock').open('a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        current=read(ident)
+        save(current,**updates)
+        return current
+
+
 def listing():
     result = []
     for p in sorted((db.DATA / 'codex-migrations').glob('*/plan.json'), key=lambda p: p.stat().st_mtime, reverse=True):
@@ -75,8 +85,12 @@ def ssh_arguments(plan):
     port = int(plan.get('port', 22))
     if not 1 <= port <= 65535:
         raise ValueError('SSH 端口无效')
+    alias = plan.get('host_key_alias')
+    if alias and not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]*', alias):
+        raise ValueError('SSH 主机身份别名无效')
     return ['ssh', '-p', str(port), '-oBatchMode=yes', '-oStrictHostKeyChecking=yes',
-            '-oConnectTimeout=12', '-oServerAliveInterval=15', '-oServerAliveCountMax=3', host]
+            '-oConnectTimeout=12', '-oServerAliveInterval=15', '-oServerAliveCountMax=3',
+            *(['-oHostKeyAlias=' + alias] if alias else []), host]
 
 
 def remote(plan, action, timeout=90, **body):
@@ -86,13 +100,18 @@ def remote(plan, action, timeout=90, **body):
     profile = base64.b64encode(zlib.compress(Path(codex_profile.__file__).read_bytes(), 9)).decode()
     attachments = base64.b64encode(zlib.compress(Path(codex_attachments.__file__).read_bytes(), 9)).decode()
     runtime_tools = base64.b64encode(zlib.compress(Path(migration_tools.__file__).read_bytes(), 9)).decode()
-    program = ("import base64,zlib,types,sys;a=types.ModuleType('atlas_codex_attachments');sys.modules[a.__name__]=a;"
+    history = base64.b64encode(zlib.compress(Path(codex_history.__file__).read_bytes(), 9)).decode()
+    program = ("import base64,zlib,types,sys;h=types.ModuleType('atlas_codex_history');sys.modules[h.__name__]=h;"
+               "exec(zlib.decompress(base64.b64decode('" + history + "')),h.__dict__);a=types.ModuleType('atlas_codex_attachments');sys.modules[a.__name__]=a;"
                "exec(zlib.decompress(base64.b64decode('" + attachments + "')),a.__dict__);m=types.ModuleType('atlas_codex_profile');"
                "sys.modules[m.__name__]=m;exec(zlib.decompress(base64.b64decode('" + profile + "')),m.__dict__);"
                "t=types.ModuleType('atlas_migration_tools');sys.modules[t.__name__]=t;"
                "exec(zlib.decompress(base64.b64decode('" + runtime_tools + "')),t.__dict__);"
                "exec(zlib.decompress(base64.b64decode('" + encoded + "')))")
-    command = 'python3 -c ' + shlex.quote(program)
+    executable=plan.get('remote_python','python3')
+    if executable!='python3' and (not Path(executable).is_absolute() or '\n' in executable):
+        raise ValueError('目标 Python 必须是绝对路径')
+    command = shlex.quote(executable)+' -c ' + shlex.quote(program)
     if plan.get('target', {}).get('platform') == 'Darwin':
         command = '/usr/bin/caffeinate -i ' + command
     for attempt in range(3):
@@ -302,6 +321,8 @@ def make_plan(body):
         raise ValueError('来源必须是当前运行用户；其他节点请在该节点创建任务')
     codex = home / '.codex'
     probe = {'host': body.get('host', ''), 'port': body.get('port', 22)}
+    for key in ['host_key_alias','remote_python']:
+        if body.get(key):probe[key]=body[key]
     target = remote(probe, 'inspect')
     if target['platform'] not in {'Darwin', 'Linux'}:
         raise ValueError('本版迁移接收器支持 macOS/Linux；目标桌面兼容性另行验收')
@@ -430,7 +451,7 @@ def _rsync_once(plan, source, destination, log, checksum=False, root=None):
                 # Worker stdout uses O_APPEND. Bound diagnostic disk consumption.
                 with log.open('wb'):
                     pass
-            save(plan, transfer_pid=process.pid)
+            patch_plan(plan['id'],progress=plan['progress'],transfer_pid=process.pid)
             time.sleep(2)
         if process.returncode:
             with log.open('rb') as f:
@@ -767,9 +788,9 @@ def verify_native(ident):
     plan = read(ident)
     if plan['status'] not in {'activated_pending_acceptance', 'native_verified'}:
         raise ValueError('请先接入目标环境，再执行原生验收')
-    report = remote(plan, 'accept_native', timeout=3600)
+    report = remote(plan, 'accept_native', timeout=10800)
     agent.atomic_json(folder(ident) / 'native-acceptance.json', report)
-    save(plan, status='native_verified' if report['status']=='passed' else 'activated_pending_acceptance',
+    patch_plan(ident, status='native_verified' if report['status']=='passed' else 'activated_pending_acceptance',
          native_acceptance=report, detail='原生 Codex 会话和历史读取验收通过；工程运行依赖需单独验收' if report['status']=='passed' else '原生验收发现问题，保留全部原始副本')
     return report
 
@@ -807,7 +828,7 @@ def reports(ident):
                 if p.name in {'verification.json', 'activation.json', 'native-acceptance.json',
                               'atlas-deployment.json', 'workspace-acceptance.json', 'completion.json',
                               'attachment-recovery.json', 'attachment-recovery-progress.json',
-                              'tool-verification.json', 'tool-installation.json', 'python-runtime-rebinding.json', 'python-runtime-acceptance.json', 'rollout-path-rebinding.json'}}
+                              'tool-verification.json', 'tool-installation.json', 'python-runtime-rebinding.json', 'python-runtime-acceptance.json', 'rollout-path-rebinding.json','history-maintenance.json','finished-history-acceptance.json'}}
     return remote(plan, 'report')
 
 
@@ -838,14 +859,60 @@ def install_tools(ident, supplement_id):
 
 
 def repair_paths(ident):
+    raise ValueError('旧版原位路径修复已停用；请依次使用 prepare-history、verify-history、install-history')
+
+
+def maintain_history(ident, action):
+    if action not in {'prepare_history','verify_history','install_history'}:
+        raise ValueError('历史维护操作无效')
     plan = read(ident)
-    if plan['status'] not in {'activated_pending_acceptance', 'native_verified'}:
+    if plan['status'] not in {'activated_pending_acceptance','native_verified','complete'}:
         raise ValueError('请先接入目标环境')
-    report = remote(plan, 'repair_active_paths', timeout=1800, allow_app_restart=True)
-    agent.atomic_json(folder(ident) / 'rollout-path-rebinding.json', report)
-    save(plan, status='activated_pending_acceptance', rollout_paths=report,
-         native_acceptance=None, workspace_acceptance=None, detail='日志与数据库路径已重绑定，等待重新验收')
+    report = remote(plan, action, timeout=10800, allow_app_restart=action=='install_history')
+    agent.atomic_json(folder(ident)/'history-maintenance.json',report)
+    plan=patch_plan(ident,history_maintenance=report)
+    if action=='install_history':
+        delta=dict(plan.get('finished_history') or {})
+        if delta.get('status')=='staged':delta['status']='installed'
+        patch_plan(ident,status='activated_pending_acceptance',native_acceptance=None,finished_history=delta,
+             detail='历史修复已接入；保留切换前副本，等待目标原生全量验收')
     return report
+
+
+def capture_finished_history(ident):
+    plan=read(ident)
+    coverage=remote(plan,'history_coverage',timeout=180)
+    delta_id=uuid.uuid4().hex
+    output=folder(ident)/'finished-history'/delta_id
+    captured=codex_history.capture_finished(Path(plan['source_home'])/'.codex',coverage,output)
+    receipt=remote(plan,'prepare_finished',delta_id=delta_id)
+    rsync(plan,str(output)+'/',receipt['path']+'/',folder(ident)/'finished-history-transfer.log')
+    record={'id':delta_id,'path':str(output),'remote_path':receipt['path'],
+        'manifest_sha256':agent.digest(output/'manifest.json'),'branches':len(captured['branches']),
+        'pending_turns':captured['pending_turns'],'captured_at':captured['captured_at'],'status':'captured'}
+    plan=read(ident)
+    save(plan,finished_history=record)
+    return record
+
+
+def apply_finished_history(ident):
+    plan=read(ident);delta=plan.get('finished_history')
+    if not delta or delta['status']!='captured':raise ValueError('请先捕获已结束会话的尾差')
+    report=remote(plan,'merge_finished',timeout=5400,delta_id=delta['id'],manifest_sha256=delta['manifest_sha256'])
+    delta.update(status='staged')
+    patch_plan(ident,history_maintenance=report,finished_history=delta)
+    agent.atomic_json(folder(ident)/'history-maintenance.json',report)
+    return report
+
+
+def finished_history_drift(plan):
+    source=codex_history.terminal_coverage(Path(plan['source_home'])/'.codex')
+    target=remote(plan,'history_coverage',timeout=180)
+    missing=[key for key,value in source.items() if target.get(key)!=value]
+    result={'status':'passed' if not missing else 'needs_attention','closed_turns_checked':len(source),
+        'unmerged_closed_turns':missing,'checked_at':time.time(),'scope':'closed_source_turns_only_future_inflight_output_not_claimed'}
+    agent.atomic_json(folder(plan['id'])/'finished-history-acceptance.json',result)
+    return result
 
 
 def repair_runtimes(ident):
@@ -868,7 +935,7 @@ def verify_workspaces(ident):
     report = remote(plan, 'verify_workspaces', timeout=7200,
                     source_missing_transient_workspaces=plan['source_missing_transient_workspaces'])
     agent.atomic_json(folder(ident) / 'workspace-acceptance.json', report)
-    save(plan, workspace_acceptance=report)
+    patch_plan(ident, workspace_acceptance=report)
     return report
 
 
@@ -888,11 +955,17 @@ def complete(ident):
     for name in ['verification.json', 'native-acceptance.json', 'workspace-acceptance.json']:
         if receipt.get(name, {}).get('status') != 'passed':
             raise ValueError('验收尚未通过：' + name)
+    native = receipt['native-acceptance.json']
+    if (native.get('full_history') or {}).get('status') != 'passed' or (native.get('offsets') or {}).get('status') != 'passed':
+        raise ValueError('需要全量历史字段与日志偏移验收；旧版抽样报告不能完成迁移')
+    drift=finished_history_drift(plan)
+    if drift['status']!='passed':
+        raise ValueError('来源有已结束但尚未接入的轮次；请捕获并验证尾差：'+str(len(drift['unmerged_closed_turns'])))
     if plan.get('atlas') and receipt.get('atlas-deployment.json', {}).get('status') != 'running':
         raise ValueError('目标 Atlas 尚未完成部署')
     if plan.get('tool_supplement') and receipt.get('tool-installation.json', {}).get('status') != 'passed':
         raise ValueError('补充工具尚未通过目标运行验收')
-    result = remote(plan, 'complete', timeout=60)
+    result = remote(plan, 'complete', timeout=60, finished_history_acceptance=drift)
     save(plan, status='complete', phase='complete', completion=result,
          detail='文件、原生会话、工程 Git 与目标 Atlas 验收通过；源机保留，工程构建和外部设备未逐项执行')
     return result
@@ -901,7 +974,7 @@ def complete(ident):
 def main():
     import argparse
     parser = argparse.ArgumentParser(description='Atlas Codex 迁移')
-    parser.add_argument('action', choices=['plan', 'start', 'worker', 'status', 'prepare-profile', 'activate', 'verify-native', 'deploy-atlas', 'verify-workspaces', 'repair-runtimes', 'repair-paths', 'install-tools', 'complete'])
+    parser.add_argument('action', choices=['plan', 'start', 'worker', 'status', 'prepare-profile', 'activate', 'verify-native', 'deploy-atlas', 'verify-workspaces', 'repair-runtimes', 'repair-paths', 'install-tools', 'complete','prepare-history','verify-history','install-history','capture-finished','apply-finished'])
     parser.add_argument('value', nargs='?')
     parser.add_argument('--supplement')
     args = parser.parse_args()
@@ -911,6 +984,12 @@ def main():
         activation_worker(args.value, args.action == 'activate')
     elif args.action == 'verify-native':
         print(json.dumps(verify_native(args.value),ensure_ascii=False))
+    elif args.action in {'prepare-history','verify-history','install-history'}:
+        print(json.dumps(maintain_history(args.value,args.action.replace('-','_')),ensure_ascii=False))
+    elif args.action=='capture-finished':
+        print(json.dumps(capture_finished_history(args.value),ensure_ascii=False))
+    elif args.action=='apply-finished':
+        print(json.dumps(apply_finished_history(args.value),ensure_ascii=False))
     elif args.action == 'deploy-atlas':
         print(json.dumps(deploy_atlas(args.value),ensure_ascii=False))
     elif args.action == 'verify-workspaces':

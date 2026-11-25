@@ -39,3 +39,5 @@ typing-inspection==0.4.4
     #   pydantic
 uvicorn==0.54.0
     # via -r requirements.txt
+zstandard==0.25.0
+    # via -r requirements.txt
