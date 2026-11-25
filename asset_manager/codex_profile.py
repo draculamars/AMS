@@ -31,7 +31,7 @@ PATH_COLUMNS = {'threads': {'cwd', 'rollout_path'}, 'project_roots': {'path'}}
 JSON_PATH_COLUMNS = {'threads': {'sandbox_policy'}, 'thread_attachments': {'payload'}}
 PATH_KEYS = {'cwd', 'path', 'root', 'roots', 'writable_roots', 'image_path', 'file_path',
              'workspace', 'worktree', 'attachment_path', 'local_path', 'rollout_path', 'rootPaths',
-             'writableRoots', 'filePath', 'localPath'}
+             'writableRoots', 'filePath', 'localPath', 'common_dir', 'checkout_root', 'repo_root'}
 
 
 def map_path(value, source_home, target_home):
@@ -614,6 +614,19 @@ def native_acceptance(codex_home, evidence, source_ids, destination_ids):
         client.close()
 
 
+def rebase_git_metadata(connection, source_home, target_home):
+    count = 0
+    for ident, raw in connection.execute('SELECT id,git_json FROM projects').fetchall():
+        if not raw:
+            continue
+        original = json.loads(raw)
+        mapped = map_json_paths(original, source_home, target_home)
+        if mapped != original:
+            connection.execute('UPDATE projects SET git_json=? WHERE id=?', (json.dumps(mapped, ensure_ascii=False), ident))
+            count += 1
+    return count
+
+
 def rebase_atlas(catalog, source_home, target_home, workspaces=()):
     """Rebind current local paths and identity while keeping historical records."""
     catalog = Path(catalog)
@@ -632,6 +645,7 @@ def rebase_atlas(catalog, source_home, target_home, workspaces=()):
         aliases.append({'source': source_home, 'target': target_home})
         c.execute("INSERT OR REPLACE INTO settings VALUES('source_path_aliases',?)", (json.dumps(aliases),))
         node_id = uuid.uuid4().hex
+        counts['projects.git_json'] = rebase_git_metadata(c, source_home, target_home)
         for table, columns in fields.items():
             if table not in tables:
                 continue

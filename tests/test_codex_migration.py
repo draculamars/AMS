@@ -483,6 +483,7 @@ def test_atlas_rebinding_changes_current_paths_identity_and_invalidates_sessions
         c.execute("INSERT OR REPLACE INTO settings VALUES('node_id','source-node')")
         c.execute("INSERT OR REPLACE INTO settings VALUES('session:old-cookie','9999999999')")
         c.execute("INSERT INTO projects(id,name,path) VALUES('migrated-project','Project','/source/user/project')")
+        c.execute("UPDATE projects SET git_json=? WHERE id='migrated-project'", (json.dumps({'root':'/source/user/project','common_dir':'/source/user/project/.git','note':'Historical /source/user/project'}),))
         c.execute("INSERT INTO project_locations VALUES('migrated-project','source-node','workspace',NULL,'/source/user/project','before')")
         c.execute("INSERT INTO audits(action,detail) VALUES('historical','/source/user/project')")
     extra=target/'AI/additional';extra.mkdir(parents=True);(extra/'README.md').write_text('Previously unregistered project')
@@ -490,6 +491,9 @@ def test_atlas_rebinding_changes_current_paths_identity_and_invalidates_sessions
     report=profile.rebase_atlas(db.DATA,'/source/user',str(target),[{'relative':'AI/additional'},{'relative':'Documents/Codex/empty'}])
     with db.connect() as c:
         assert c.execute("SELECT path FROM projects WHERE id='migrated-project'").fetchone()[0]==str(target/'project')
+        metadata = json.loads(c.execute("SELECT git_json FROM projects WHERE id='migrated-project'").fetchone()[0])
+        assert metadata['root'] == str(target/'project') and metadata['common_dir'] == str(target/'project/.git')
+        assert metadata['note'] == 'Historical /source/user/project'
         assert not c.execute("SELECT * FROM settings WHERE key='session:old-cookie'").fetchone()
         assert c.execute("SELECT value FROM settings WHERE key='node_id'").fetchone()[0]!='source-node'
         assert c.execute("SELECT source_node FROM project_locations WHERE project_id='migrated-project'").fetchone()[0]=='source-node'
