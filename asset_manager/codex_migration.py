@@ -108,7 +108,27 @@ def resource_policies():
     ]
 
 
-def source_roots(home, codex):
+def historical_workspaces(home, codex):
+    found, missing = [], []
+    path = codex / 'thread_history_1.sqlite'
+    if path.exists():
+        with contextlib.closing(agent.connect_existing(path)) as c:
+            if c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='thread_items'").fetchone():
+                for row in c.execute("SELECT DISTINCT json_extract(item_json,'$.cwd') FROM thread_items WHERE item_type='commandExecution'"):
+                    if not isinstance(row[0], str):
+                        continue
+                    candidate = Path(row[0])
+                    if not candidate.is_absolute() or '..' in candidate.parts or not candidate.is_relative_to(home):
+                        continue
+                    rel = candidate.relative_to(home)
+                    if len(rel.parts) < 2 or rel.parts[0] in {'Library', '.cache', '.local'}:
+                        continue  # A diagnostic shell cwd is not permission to copy a whole profile.
+                    (found if candidate.is_dir() else missing).append(str(candidate))
+    return {'existing': sorted(set(found)), 'missing': sorted(set(missing)),
+            'source': 'persisted_command_execution_working_directories'}
+
+
+def source_roots(home, codex, discovery=None):
     roots = [codex]
     projectless_containers = set()
     config = codex / 'config.toml'
@@ -121,6 +141,15 @@ def source_roots(home, codex):
     runtime = home / '.cache/codex-runtimes'
     if runtime.exists():
         roots.append(runtime)
+    for name in ['.cache/huggingface/hub', '.cache/huggingface/datasets', '.cache/huggingface/lerobot',
+                 '.cache/torch/hub', '.cache/torch/checkpoints', '.cache/whisper', '.ollama/models', '.lmstudio/models']:
+        path = home / name
+        if path.is_dir():
+            roots.append(path)
+    historical = historical_workspaces(home, codex)
+    roots += [Path(p) for p in historical['existing']]
+    if discovery is not None:
+        discovery.update(historical)
     database = codex / 'state_5.sqlite'
     if database.exists():
         with contextlib.closing(agent.connect_existing(database)) as c:
@@ -172,7 +201,8 @@ def make_plan(body):
     root_path = Path(root)
     if not root_path.is_absolute() or '..' in root_path.parts or not root_path.is_relative_to(Path(target['home'])) or len(root_path.relative_to(target['home']).parts) < 2:
         raise ValueError('暂存目录必须位于目标用户的专用子目录')
-    roots = source_roots(home, codex) + [Path(x).expanduser() for x in body.get('extra_roots', [])]
+    discovery = {}
+    roots = source_roots(home, codex, discovery) + [Path(x).expanduser() for x in body.get('extra_roots', [])]
     # The desktop's browser profile is not an auth-portable application profile.
     # Its durable Codex state is in .codex; capture preferences separately on request.
     if body.get('include_atlas', True):
@@ -215,6 +245,7 @@ def make_plan(body):
             'status': 'planned', 'phase': 'plan', 'detail': '方案已生成；来源保留，目标先隔离接收',
             'created_at': time.time(), 'progress': {}, 'source_deleted': False, 'activation': 'not_started'}
     plan['desktop_archives'] = desktop_archives(home)
+    plan['historical_workspace_discovery'] = discovery
     if body.get('include_atlas', True):
         plan['atlas'] = {'catalog': db.DATA.relative_to(home).as_posix(),
                          'archive': db.blob_root().relative_to(home).as_posix(),

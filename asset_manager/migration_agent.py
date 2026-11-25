@@ -320,6 +320,11 @@ def prepare_activation(body):
             os.rename(root / 'destination-before-activation', previous / 'destination-before-activation')
     # Clone the source evidence. The original destination remains live and intact.
     profile.clone(src, working)
+    def prepared_destination(relative):
+        dest = working / relative
+        if not dest.parent.resolve().is_relative_to(working.resolve()):
+            raise ValueError('目标配置合并穿过来源软链接，需单独映射：' + str(relative))
+        return dest
     inactive = root / 'prepared/inactive-source-state'
     inactive.mkdir(parents=True, exist_ok=True)
     for name in ['automations', 'sqlite']:
@@ -340,7 +345,7 @@ def prepare_activation(body):
             path = base / name
             if name.endswith('.app') and not path.is_symlink():
                 relative = path.relative_to(target)
-                dest = working / relative
+                dest = prepared_destination(relative)
                 if dest.exists() or dest.is_symlink():
                     saved_bundle = inactive / 'source-bundles' / relative
                     saved_bundle.parent.mkdir(parents=True, exist_ok=True)
@@ -354,7 +359,7 @@ def prepare_activation(body):
             path = base / name
             if path.is_symlink():
                 rel = path.relative_to(target)
-                dest = working / rel
+                dest = prepared_destination(rel)
                 if dest.exists() or dest.is_symlink():
                     saved = inactive / 'source-link-conflicts' / rel
                     saved.parent.mkdir(parents=True, exist_ok=True)
@@ -365,7 +370,7 @@ def prepare_activation(body):
                 continue
             rel = path.relative_to(target)
             if rel.parts[0] == 'sqlite' and path.suffix == '.db':
-                dest = working / rel
+                dest = prepared_destination(rel)
                 dest.unlink(missing_ok=True)
                 profile.backup(path, dest)
                 continue
@@ -373,7 +378,7 @@ def prepare_activation(body):
                 continue
             if len(rel.parts) == 1 and (name in database_names or name.endswith(('-wal', '-shm', '-journal', '.lock'))):
                 continue
-            dest = working / rel
+            dest = prepared_destination(rel)
             if dest.exists() and digest(path) != digest(dest):
                 conflicts.append({'path': str(rel), 'resolution': 'target_retained_source_in_evidence'})
             if dest.exists():
@@ -392,10 +397,14 @@ def prepare_activation(body):
         # Source transient queue, goals and logs stay archived, never replayed.
     merged_config, config_conflicts = profile.merge_config(profile.load_toml(src / 'config.toml'),
         profile.load_toml(target / 'config.toml'), source_home, target_home)
+    if (working / 'config.toml').is_symlink():
+        (working / 'config.toml').unlink()  # Prepared link only; incoming original remains.
     (working / 'config.toml').write_text(profile.toml_text(merged_config))
     (working / 'config.toml').chmod(0o600)
     agents_file = working / 'AGENTS.md'
     agents_text = agents_file.read_text() if agents_file.exists() else ''
+    if agents_file.is_symlink():
+        agents_file.unlink()  # Write the migration note to the copy, never its external referent.
     note_marker = '<!-- atlas-migration:' + body['id'] + ' -->'
     if note_marker not in agents_text:
         agents_file.write_text(agents_text.rstrip() + '\n\n' + note_marker + '\n'
@@ -483,6 +492,12 @@ def activate(body):
                 if result.returncode:
                     raise ValueError('目标应用未正常退出，保持原有环境')
                 reopened.append(name)
+        # Current desktop builds may retain their daemon after the GUI exits.
+        # Use its own orderly stop command; never kill arbitrary codex processes.
+        for name in reopened:
+            cli = Path('/Applications') / (name + '.app/Contents/Resources/codex-cli/bin/codex')
+            if cli.is_file():
+                subprocess.run([str(cli), 'app-server', 'daemon', 'stop'], capture_output=True, timeout=30)
         for _ in range(30):
             processes = run(['ps', '-axo', 'comm='])
             if not any('/Applications/' + name + '.app/' in line and ('/codex' in line or '/MacOS/' + name == line[-len('/MacOS/' + name):])

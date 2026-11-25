@@ -333,3 +333,18 @@ def test_receiver_reads_receipts_locally_and_completion_requires_all_layers(env,
     assert migration.reports(ident)['verification.json']['status']=='passed'
     with pytest.raises(ValueError,match='native-acceptance'):
         migration.complete(ident)
+
+
+def test_discovery_includes_historical_working_projects_and_model_weights(tmp_path):
+    home=tmp_path/'home';codex=home/'.codex';codex.mkdir(parents=True)
+    project=home/'AI/robot/release';project.mkdir(parents=True)
+    cache=home/'.cache/huggingface/hub';cache.mkdir(parents=True)
+    browser=home/'Library/Application Support/Codex';browser.mkdir(parents=True)
+    with sqlite3.connect(codex/'thread_history_1.sqlite') as c:
+        c.execute('CREATE TABLE thread_items(item_type TEXT,item_json TEXT)')
+        for path in [home,home/'Documents',project,home/'AI/deleted',browser]:
+            c.execute('INSERT INTO thread_items VALUES(?,?)',('commandExecution',json.dumps({'cwd':str(path)})))
+    discovery={};roots=migration.source_roots(home,codex,discovery)
+    assert project in roots and cache in roots
+    assert home not in roots and home/'Documents' not in roots and browser not in roots
+    assert str(home/'AI/deleted') in discovery['missing']
