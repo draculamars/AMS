@@ -269,14 +269,19 @@ def test_atlas_rebinding_changes_current_paths_identity_and_invalidates_sessions
         c.execute("INSERT INTO projects(id,name,path) VALUES('migrated-project','Project','/source/user/project')")
         c.execute("INSERT INTO project_locations VALUES('migrated-project','source-node','workspace',NULL,'/source/user/project','before')")
         c.execute("INSERT INTO audits(action,detail) VALUES('historical','/source/user/project')")
-    report=profile.rebase_atlas(db.DATA,'/source/user',str(target))
+    extra=target/'AI/additional';extra.mkdir(parents=True);(extra/'README.md').write_text('Previously unregistered project')
+    empty=target/'Documents/Codex/empty';empty.mkdir(parents=True)
+    report=profile.rebase_atlas(db.DATA,'/source/user',str(target),[{'relative':'AI/additional'},{'relative':'Documents/Codex/empty'}])
     with db.connect() as c:
         assert c.execute("SELECT path FROM projects WHERE id='migrated-project'").fetchone()[0]==str(target/'project')
         assert not c.execute("SELECT * FROM settings WHERE key='session:old-cookie'").fetchone()
         assert c.execute("SELECT value FROM settings WHERE key='node_id'").fetchone()[0]!='source-node'
         assert c.execute("SELECT source_node FROM project_locations WHERE project_id='migrated-project'").fetchone()[0]=='source-node'
         assert c.execute("SELECT detail FROM audits WHERE action='historical'").fetchone()[0]=='/source/user/project'
+        assert c.execute('SELECT path FROM projects WHERE path=?',(str(extra),)).fetchone()
+        assert not c.execute('SELECT path FROM projects WHERE path=?',(str(empty),)).fetchone()
     assert report['updated']['projects.path']>=1
+    assert len(report['imported_workspaces'])==1
 
 
 def test_historical_path_alias_keeps_artifact_links_without_rewriting_messages():

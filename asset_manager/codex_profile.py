@@ -480,14 +480,14 @@ def native_acceptance(codex_home, evidence, source_ids, destination_ids):
         client.close()
 
 
-def rebase_atlas(catalog, source_home, target_home):
+def rebase_atlas(catalog, source_home, target_home, workspaces=()):
     """Rebind current local paths and identity while keeping historical records."""
     catalog = Path(catalog)
     fields = {'projects': ['path'], 'assets': ['repo_root'],
         'repositories': ['source_root', 'common_dir', 'archive_path'],
         'repository_archives': ['archive_path'], 'project_repositories': ['checkout_root'],
         'project_index_runs': ['manifest'], 'knowledge_items': ['path']}
-    counts = {}
+    counts, imported = {}, []
     with sqlite3.connect(catalog / 'catalog.sqlite3') as c:
         c.execute('PRAGMA foreign_keys=ON')
         tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -507,6 +507,22 @@ def rebase_atlas(catalog, source_home, target_home):
                 result = c.execute('UPDATE ' + quote(table) + ' SET ' + q + '=? || substr(' + q + ',?) WHERE substr(' + q + ',1,?)=?',
                     (target_home, len(source_home)+1, len(source_home)+1, source_home+'/'))
                 counts[table+'.'+col] = result.rowcount
+        existing_paths = [Path(r[0]) for r in c.execute('SELECT path FROM projects')]
+        for row in workspaces:
+            relative = Path(row['relative'])
+            if not relative.parts or relative.parts[0] in {'.codex', '.cache', '.local', 'Library'}:
+                continue
+            path = Path(target_home) / relative
+            if not path.is_relative_to(target_home) or path.is_relative_to(catalog.parent) or not path.is_dir():
+                continue
+            if any(path.is_relative_to(p) or p.is_relative_to(path) for p in existing_paths):
+                continue  # An umbrella directory should not duplicate its projects.
+            if not any(p.is_file() and p.name != '.DS_Store' for p in path.iterdir()) and not (path / '.git').exists():
+                continue
+            ident = str(uuid.uuid5(uuid.NAMESPACE_URL, source_home + '/' + relative.as_posix()))
+            c.execute('INSERT INTO projects(id,name,path,host) VALUES(?,?,?,?)', (ident, path.name, str(path), 'local'))
+            existing_paths.append(path)
+            imported.append({'id': ident, 'path': str(path)})
         c.execute("INSERT OR REPLACE INTO settings VALUES('node_id',?)", (node_id,))
         c.execute("DELETE FROM settings WHERE key IN ('node_label','watch_status','provenance_status') OR key LIKE 'watch_git:%' OR key LIKE 'watch_initialized:%' OR key LIKE 'session:%'")
         c.execute("INSERT OR REPLACE INTO settings VALUES('codex_source_root',?)", (target_home+'/.codex',))
@@ -525,7 +541,8 @@ def rebase_atlas(catalog, source_home, target_home):
                 c.execute('DELETE FROM sessions')
         if c.execute('PRAGMA foreign_key_check').fetchone():
             raise ValueError('Atlas 路径重绑定后发现引用完整性错误')
-    return {'node_id': node_id, 'source_node_id': prior[0] if prior else None, 'updated': counts}
+    return {'node_id': node_id, 'source_node_id': prior[0] if prior else None, 'updated': counts,
+            'imported_workspaces': imported}
 
 
 def workspace_acceptance(root, source_home, target_home):

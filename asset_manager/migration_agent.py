@@ -659,7 +659,7 @@ def deploy_atlas(body):
     app_python = app / '.venv/bin/python'
     execute([app_python, '-c', 'import fastapi,uvicorn,multipart,sqlite3'])
     source_home = json.loads((root / 'ATLAS-MIGRATION.json').read_text())['source_home']
-    rebased = profile.rebase_atlas(catalog, source_home, str(home))
+    rebased = profile.rebase_atlas(catalog, source_home, str(home), body.get('plan', {}).get('roots', []))
     port = int(body.get('port', 8765))
     if not 1024 <= port <= 65535:
         raise ValueError('部署端口无效')
