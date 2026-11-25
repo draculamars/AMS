@@ -9,6 +9,7 @@ import pytest
 from test_assets import env, client, HEADERS
 from asset_manager import codex_migration as migration, migration_agent as agent
 from asset_manager import codex_profile as profile
+from asset_manager import codex_attachments as attachments
 
 
 def test_ssh_arguments_reject_option_and_shell_injection():
@@ -387,3 +388,67 @@ def test_python_environment_references_rebase_without_rewriting_code_or_readme(t
     assert entry.read_text()=='#!/new/user/project/.venv/bin/python\nprint("Historical /old/user")\n'
     assert entry.stat().st_mode & 0o777==0o755
     assert (packages/'editable.pth').read_text()=='/new/user/project/src\nimport unrelated_loader\n'
+
+
+def attachment_fixture(tmp_path):
+    root=tmp_path/'job';codex=root/'incoming/.codex';(codex/'sessions').mkdir(parents=True);(root/'evidence').mkdir()
+    with sqlite3.connect(codex/'thread_history_1.sqlite') as c:
+        c.execute('CREATE TABLE thread_items(item_type TEXT,item_json TEXT)')
+        c.execute('INSERT INTO thread_items VALUES(?,?)',('userMessage',json.dumps({'type':'userMessage','content':[{'type':'localImage','path':'/tmp/missing.png'}]})))
+    return root,codex/'sessions/rollout.jsonl'
+
+
+def image_record(data,path='/tmp/missing.png'):
+    import base64
+    return {'type':'compacted','payload':{'replacement_history':[{'type':'message','role':'user','content':[
+        {'type':'input_text','text':'<image name=[Image #1] path="'+path+'">'},
+        {'type':'input_image','image_url':'data:image/png;base64,'+base64.b64encode(data).decode()},
+        {'type':'input_text','text':'</image>'}]}]}}
+
+
+def test_embedded_attachment_recovery_is_evidenced_bounded_and_keeps_originals(tmp_path):
+    root,rollout=attachment_fixture(tmp_path);data=b'\x89PNG\r\n\x1a\nfixture'
+    rollout.write_bytes(b'x'*2048+b'\n'+json.dumps(image_record(data)).encode()+b'\n')
+    before=agent.digest(rollout)
+    result=attachments.recover(root,'/old/user','/new/user',max_record_bytes=1024)
+    assert result['recovered_paths']==1 and result['unresolved_user_images']==0
+    assert result['records_skipped'][0]['reason']=='record_size_limit'
+    assert agent.digest(rollout)==before
+    item=next(iter(result['files'].values()))
+    assert Path(item['source']).read_bytes()==data and item['line']==2
+    original={'type':'userMessage','content':[{'type':'text','text':'Original /old/user/path'}, {'type':'localImage','path':'/tmp/missing.png'}]}
+    mapped=attachments.relocate_item(original,'/old/user','/new/user',result['aliases'])
+    assert mapped['content'][0]==original['content'][0]
+    assert mapped['content'][1]['path'].startswith('/new/user/.codex/attachments/atlas-recovered/')
+    assert original['content'][1]['path']=='/tmp/missing.png'
+    tool={'type':'mcpToolCall','arguments':{'path':'/old/user/file'}}
+    assert attachments.relocate_item(tool,'/old/user','/new/user')==tool
+
+
+def test_recovery_does_not_guess_between_conflicting_images_or_text_mentions(tmp_path):
+    root,rollout=attachment_fixture(tmp_path)
+    records=[image_record(b'first'),image_record(b'second')]
+    rollout.write_text(''.join(json.dumps(r)+'\n' for r in records))
+    result=attachments.recover(root,'/old/user','/new/user')
+    assert result['recovered_paths']==0 and result['unresolved_user_images']==1
+    assert result['ambiguous_paths']==['/tmp/missing.png'] and len(result['files'])==2
+    wrong=image_record(b'data');wrong['payload']['replacement_history'][0]['content'][0]['text']='Example /tmp/missing.png'
+    assert list(attachments.embedded_images(wrong))==[]
+
+
+def test_exclusion_boundaries_and_resume_reuse_complete_snapshots(env,monkeypatch):
+    from types import SimpleNamespace
+    plan={'excluded':[{'path':'/source/cache'}]}
+    assert migration.filtered(plan,Path('/source/cache/a'))
+    assert not migration.filtered(plan,Path('/source/cache-other/a'))
+    plan['excluded'].append({'path':'/source/new'})
+    assert migration.filtered(plan,Path('/source/new'))
+    ident='f'*32
+    plan.update(id=ident,status='paused',phase='manifest',captured_at=1,source_home=str(Path.home()),
+                database_snapshots=[{'path':'.codex/state_5.sqlite','sha256':'saved'}])
+    migration.save(plan)
+    monkeypatch.setattr(migration.subprocess,'Popen',lambda *a,**kw:SimpleNamespace(pid=99999))
+    migration.start(ident)
+    saved=migration.read(ident)
+    assert saved['reuse_snapshots'] and saved['skip_initial_copy']
+    assert saved['database_snapshots']==plan['database_snapshots']

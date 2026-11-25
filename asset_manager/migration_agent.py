@@ -155,11 +155,13 @@ def prepare(body):
     root = checked_root(body['root'], True)
     marker = root / 'ATLAS-MIGRATION.json'
     if marker.exists():
-        if json.loads(marker.read_text())['id'] != body['id']:
+        existing = json.loads(marker.read_text())
+        if existing['id'] != body['id'] or existing.get('source_home') != body['source_home']:
             raise ValueError('暂存目录属于另一个迁移任务')
     elif any(root.iterdir()):
         raise ValueError('拒绝使用已有资料的非空目录')
-    atomic_json(marker, {'id': body['id'], 'source_home': body['source_home'], 'created_at': time.time()})
+    else:
+        atomic_json(marker, {'id': body['id'], 'source_home': body['source_home'], 'created_at': time.time()})
     (root / 'incoming').mkdir(exist_ok=True, mode=0o700)
     (root / 'evidence').mkdir(exist_ok=True, mode=0o700)
     if body.get('keep_awake') and sys.platform == 'darwin':
@@ -299,6 +301,7 @@ def verify(body):
 
 def prepare_activation(body):
     import atlas_codex_profile as profile
+    import atlas_codex_attachments as attachments
     root = checked_root(body['root'])
     receipt = json.loads((root / 'evidence/verification.json').read_text())
     if receipt['status'] != 'passed' or receipt.get('manifest_sha256') != digest(root / 'evidence/source-manifest.jsonl'):
@@ -307,6 +310,8 @@ def prepare_activation(body):
     if marker['id'] != body['id']:
         raise ValueError('迁移任务标识不匹配')
     source_home, target_home = marker['source_home'], str(Path.home())
+    recovered = attachments.recover(root, source_home, target_home, body.get('attachments_sha256'))
+    atomic_json(root / 'evidence/attachment-recovery.json', recovered)
     src = root / 'incoming/.codex'
     target = Path.home() / '.codex'
     working = root / 'prepared/.codex'
@@ -327,6 +332,12 @@ def prepare_activation(body):
         return dest
     inactive = root / 'prepared/inactive-source-state'
     inactive.mkdir(parents=True, exist_ok=True)
+    for relative, item in recovered['files'].items():
+        dest = prepared_destination(Path(relative).relative_to('.codex'))
+        if not dest.exists():
+            profile.clone(item['source'], dest)
+        if digest(dest) != item['sha256']:
+            raise ValueError('恢复附件的工作副本校验失败')
     for name in ['automations', 'sqlite']:
         if (working / name).exists():
             os.rename(working / name, inactive / name)
@@ -391,7 +402,7 @@ def prepare_activation(body):
             profile.backup(target_db, preserve / name)
         if name in profile.DATABASE_TABLES and source_db.exists():
             merged[name] = profile.merge_database(source_db, preserve / name, output,
-                profile.DATABASE_TABLES[name], source_home, target_home)
+                profile.DATABASE_TABLES[name], source_home, target_home, recovered['aliases'])
         elif target_db.exists():
             profile.clone(preserve / name, output)
         # Source transient queue, goals and logs stay archived, never replayed.
@@ -444,6 +455,7 @@ def prepare_activation(body):
             if not path.exists() and (rel is None or not (root / 'incoming' / rel).exists()):
                 dependencies.append({'path': str(path), 'kind': 'missing_cwd'})
     report = {'status': 'prepared', 'merged': merged, 'settings_conflicts': conflicts,
+              'attachments': {k: v for k, v in recovered.items() if k not in {'files', 'aliases'}},
               'config_target_preferred_keys': config_conflicts,
               'source_automations': 'archived_inactive_to_avoid_duplicate_execution',
               'references': repairs, 'dependencies': dependencies,
@@ -600,6 +612,19 @@ def accept_native(body):
             return [r[0] for r in c.execute('SELECT id FROM threads')]
     result = profile.native_acceptance(Path.home() / '.codex', root / 'evidence',
         ids(root / 'incoming/.codex/state_5.sqlite'), ids(root / 'destination-original-codex/state_5.sqlite'))
+    recovered = root / 'evidence/attachment-recovery.json'
+    if recovered.exists():
+        recovery = json.loads(recovered.read_text())
+        errors = []
+        for relative, item in recovery['files'].items():
+            path = Path.home() / relative
+            if not path.is_file() or digest(path) != item['sha256']:
+                errors.append(relative)
+        result['attachments'] = {'checked_files': len(recovery['files']), 'errors': errors,
+            'unresolved_source_user_images': recovery['unresolved_user_images'],
+            'recovered_paths': recovery['recovered_paths']}
+        if errors:
+            result['status'] = 'failed'
     atomic_json(root / 'evidence/native-acceptance.json', result)
     if result['status'] == 'passed':
         activation['status'] = 'accepted'
@@ -716,6 +741,16 @@ def main():
             existing = [r[0] for r in c.execute('SELECT id FROM threads')]
         result = profile.native_acceptance(Path.home() / '.codex', root / 'evidence', [], existing)
         atomic_json(root / 'evidence/native-probe.json', result)
+    elif action == 'attachment_references':
+        import atlas_codex_attachments as attachments
+        root = checked_root(body['root'])
+        result = attachments.references(root / 'incoming/.codex/thread_history_1.sqlite')
+    elif action == 'prepare_attachment_inputs':
+        root = checked_root(body['root'])
+        if json.loads((root / 'ATLAS-MIGRATION.json').read_text())['id'] != body['id']:
+            raise ValueError('任务标识不一致')
+        (root / 'supplements/attachments').mkdir(parents=True, exist_ok=True, mode=0o700)
+        result = {'ready': True}
     elif action == 'deploy_atlas':
         result = deploy_atlas(body)
     elif action == 'verify_workspaces':
@@ -768,7 +803,7 @@ def main():
     elif action == 'report':
         root = checked_root(body['root'])
         result = {}
-        for name in ['verification-progress.json', 'verification.json', 'activation.json', 'native-acceptance.json', 'atlas-deployment.json', 'workspace-acceptance.json', 'completion.json']:
+        for name in ['verification-progress.json', 'verification.json', 'activation.json', 'native-acceptance.json', 'atlas-deployment.json', 'workspace-acceptance.json', 'completion.json', 'attachment-recovery-progress.json', 'attachment-recovery.json']:
             p = root / 'evidence' / name
             if p.is_file():
                 result[name] = json.loads(p.read_text())

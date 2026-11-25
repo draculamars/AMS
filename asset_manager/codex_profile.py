@@ -148,7 +148,7 @@ def persistent_signature(path, tables):
     return h.hexdigest()
 
 
-def merge_database(source, existing, output, tables, source_home, target_home):
+def merge_database(source, existing, output, tables, source_home, target_home, attachment_paths=None):
     """Merge persistent records into a destination-schema copy, transactionally.
 
     Any divergent primary key fails the entire prepared database. Existing target
@@ -160,6 +160,9 @@ def merge_database(source, existing, output, tables, source_home, target_home):
         raise ValueError('拒绝覆盖已有准备数据库')
     backup(existing if existing.exists() else source, output)
     report = {}
+    attachments = sys.modules.get('atlas_codex_attachments')
+    if attachments is None:
+        from . import codex_attachments as attachments
     try:
         with contextlib.closing(connection(source)) as src, contextlib.closing(sqlite3.connect(output)) as dst:
             dst.row_factory = sqlite3.Row
@@ -204,6 +207,11 @@ def merge_database(source, existing, output, tables, source_home, target_home):
                             mapped = map_json_paths(value, source_home, target_home)
                             if mapped != value:
                                 row[col] = json.dumps(mapped, ensure_ascii=False, separators=(',', ':'))
+                    if table == 'thread_items' and row.get('item_type') in {'userMessage', 'imageView', 'fileChange', 'commandExecution'}:
+                        item = json.loads(row['item_json'])
+                        mapped = attachments.relocate_item(item, source_home, target_home, attachment_paths)
+                        if mapped != item:
+                            row['item_json'] = json.dumps(mapped, ensure_ascii=False, separators=(',', ':'))
                     where = ' AND '.join(quote(k) + '=?' for k in keys)
                     found = dst.execute('SELECT * FROM ' + quote(table) + ' WHERE ' + where, [row[k] for k in keys]).fetchone()
                     if found and existing.exists():
@@ -448,8 +456,11 @@ def native_acceptance(codex_home, evidence, source_ids, destination_ids):
             samples = [r[0] for r in c.execute('SELECT thread_id FROM thread_turns GROUP BY thread_id ORDER BY count(*) DESC')]
         for ident in samples:
             try:
-                result = client.request('thread/turns/list', {'threadId': ident, 'limit': 1})
-                history_samples.append({'id': ident, 'returned_turns': len(result.get('data', []))})
+                result = client.request('thread/turns/list', {'threadId': ident, 'limit': 1, 'itemsView': 'summary'})
+                items = client.request('thread/items/list', {'threadId': ident, 'limit': 2})
+                history_samples.append({'id': ident, 'returned_turns': len(result.get('data', [])),
+                                        'returned_items': len(items.get('data', [])),
+                                        'item_types': [r.get('type') for r in items.get('data', [])]})
             except ValueError as exc:
                 errors.append({'id': ident, 'error': str(exc)})
         resume_test, skills = None, None
@@ -510,10 +521,11 @@ def rebase_atlas(catalog, source_home, target_home, workspaces=()):
         existing_paths = [Path(r[0]) for r in c.execute('SELECT path FROM projects')]
         for row in workspaces:
             relative = Path(row['relative'])
-            if not relative.parts or relative.parts[0] in {'.codex', '.cache', '.local', 'Library'}:
+            if relative.is_absolute() or '..' in relative.parts or not relative.parts or relative.parts[0] in {'.codex', '.cache', '.local', 'Library'}:
                 continue
             path = Path(target_home) / relative
-            if not path.is_relative_to(target_home) or path.is_relative_to(catalog.parent) or not path.is_dir():
+            infrastructure = [catalog] + [catalog.parent / name for name in ['archive', 'backups', 'tools', 'app']]
+            if not path.is_relative_to(target_home) or path == catalog.parent or any(path.is_relative_to(p) for p in infrastructure) or not path.is_dir():
                 continue
             if any(path.is_relative_to(p) or p.is_relative_to(path) for p in existing_paths):
                 continue  # An umbrella directory should not duplicate its projects.

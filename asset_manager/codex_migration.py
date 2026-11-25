@@ -5,6 +5,7 @@ password collection, or migration of live RAM/swap is provided by this module.
 """
 import base64
 import contextlib
+import functools
 import hashlib
 import json
 import os
@@ -19,7 +20,7 @@ import time
 import uuid
 import zlib
 from pathlib import Path
-from . import db, migration_agent as agent, codex_profile
+from . import db, migration_agent as agent, codex_profile, codex_attachments
 
 CODEx_TRANSIENT = {'ipc', 'tmp', '.tmp', 'app-server-control', 'thread-writer-locks',
                    'project-metadata-locks', 'process_manager', 'shell_snapshots',
@@ -78,7 +79,9 @@ def remote(plan, action, timeout=90, **body):
     source = Path(agent.__file__).read_bytes()
     encoded = base64.b64encode(zlib.compress(source, 9)).decode()
     profile = base64.b64encode(zlib.compress(Path(codex_profile.__file__).read_bytes(), 9)).decode()
-    program = ("import base64,zlib,types,sys;m=types.ModuleType('atlas_codex_profile');"
+    attachments = base64.b64encode(zlib.compress(Path(codex_attachments.__file__).read_bytes(), 9)).decode()
+    program = ("import base64,zlib,types,sys;a=types.ModuleType('atlas_codex_attachments');sys.modules[a.__name__]=a;"
+               "exec(zlib.decompress(base64.b64decode('" + attachments + "')),a.__dict__);m=types.ModuleType('atlas_codex_profile');"
                "sys.modules[m.__name__]=m;exec(zlib.decompress(base64.b64decode('" + profile + "')),m.__dict__);"
                "exec(zlib.decompress(base64.b64decode('" + encoded + "')))")
     command = 'python3 -c ' + shlex.quote(program)
@@ -294,12 +297,16 @@ def make_plan(body):
     return plan
 
 
+@functools.lru_cache(maxsize=32)
+def _exclusion_rules(paths):
+    exact = frozenset(str(Path(p)) for p in paths)
+    return exact, tuple(p.rstrip(os.sep) + os.sep for p in exact)
+
+
 def filtered(plan, path):
-    for row in plan['excluded']:
-        excluded = Path(row['path'])
-        if path == excluded or path.is_relative_to(excluded):
-            return True
-    return False
+    exact, descendants = _exclusion_rules(tuple(row['path'] for row in plan['excluded']))
+    value = str(path)
+    return value in exact or value.startswith(descendants)
 
 
 def _rsync_once(plan, source, destination, log, checksum=False, root=None):
@@ -481,47 +488,48 @@ def transfer(ident):
                         continue
                     save(plan, phase='copy', detail='传输 ' + row['relative'], progress={'root': i, 'roots': len(plan['roots'])})
                     rsync(plan, row['source'] + '/', plan['root'] + '/incoming/' + row['relative'] + '/', log, root=Path(row['source']))
-            save(plan, phase='databases', detail='逐个保存并发送数据库一致快照', database_snapshots=[], capture_started_at=time.time())
-            for value in plan['databases']:
-                source = Path(value)
-                snapshot = location / 'database-snapshot.sqlite'
-                snapshot.unlink(missing_ok=True)  # Only this task's previous scratch snapshot.
-                reserve = 384 * 1024**2
-                if shutil.disk_usage(location).free < source.stat().st_size + reserve:
-                    raise ValueError('本机暂存一份数据库的空间不足；保留文件，可调整暂存位置后续传')
-                info = snapshot_database(source, snapshot)
-                relative = source.relative_to(plan['source_home']).as_posix()
-                remote(plan, 'mkdir', paths=[str(Path(relative).parent)])
-                rsync(plan, snapshot, plan['root'] + '/incoming/' + relative, log)
-                plan['database_snapshots'].append({'path': relative, 'type': 'file', **info})
-                save(plan)
-                snapshot.unlink()
-            codex = Path(plan['source_home']) / '.codex'
-            persistent = []
-            for name in ['sessions', 'archived_sessions']:
-                persistent += [p for p in (codex / name).rglob('*') if p.is_file() and not p.is_symlink()]
-                base = codex / name
-                if base.exists():
-                    for directory in [base] + [p for p in base.rglob('*') if p.is_dir() and not p.is_symlink()]:
-                        plan['database_snapshots'].append({'path': directory.relative_to(plan['source_home']).as_posix(),
-                            'type': 'directory', 'mode': stat.S_IMODE(directory.stat().st_mode),
-                            'xattrs': agent.attributes(directory), 'snapshot_directory': True})
-            directories = [r['path'] for r in plan['database_snapshots'] if r['type'] == 'directory']
-            if directories:
-                remote(plan, 'mkdir', paths=directories)
-            persistent += [codex / name for name in ['.codex-global-state.json', '.codex-global-state.json.bak', 'session_index.jsonl'] if (codex / name).is_file()]
-            persistent += [Path(p) for p in plan.get('desktop_archives', desktop_archives(plan['source_home']))]
-            persistent += [Path(p) for p in plan.get('frozen_files', [])]
-            for source in persistent:
-                snapshot = location / 'persistent-snapshot'
-                info = snapshot_file(source, snapshot, preserve_mode=str(source) in plan.get('frozen_files', []))
-                relative = source.relative_to(plan['source_home']).as_posix()
-                remote(plan, 'mkdir', paths=[str(Path(relative).parent)])
-                rsync(plan, snapshot, plan['root'] + '/incoming/' + relative, log)
-                plan['database_snapshots'].append({'path': relative, 'type': 'file', **info})
-                save(plan)
-                snapshot.unlink()
-            save(plan, captured_at=time.time())
+            if not plan.get('reuse_snapshots'):
+                save(plan, phase='databases', detail='逐个保存并发送数据库一致快照', database_snapshots=[], capture_started_at=time.time())
+                for value in plan['databases']:
+                    source = Path(value)
+                    snapshot = location / 'database-snapshot.sqlite'
+                    snapshot.unlink(missing_ok=True)  # Only this task's previous scratch snapshot.
+                    reserve = 384 * 1024**2
+                    if shutil.disk_usage(location).free < source.stat().st_size + reserve:
+                        raise ValueError('本机暂存一份数据库的空间不足；保留文件，可调整暂存位置后续传')
+                    info = snapshot_database(source, snapshot)
+                    relative = source.relative_to(plan['source_home']).as_posix()
+                    remote(plan, 'mkdir', paths=[str(Path(relative).parent)])
+                    rsync(plan, snapshot, plan['root'] + '/incoming/' + relative, log)
+                    plan['database_snapshots'].append({'path': relative, 'type': 'file', **info})
+                    save(plan)
+                    snapshot.unlink()
+                codex = Path(plan['source_home']) / '.codex'
+                persistent = []
+                for name in ['sessions', 'archived_sessions']:
+                    persistent += [p for p in (codex / name).rglob('*') if p.is_file() and not p.is_symlink()]
+                    base = codex / name
+                    if base.exists():
+                        for directory in [base] + [p for p in base.rglob('*') if p.is_dir() and not p.is_symlink()]:
+                            plan['database_snapshots'].append({'path': directory.relative_to(plan['source_home']).as_posix(),
+                                'type': 'directory', 'mode': stat.S_IMODE(directory.stat().st_mode),
+                                'xattrs': agent.attributes(directory), 'snapshot_directory': True})
+                directories = [r['path'] for r in plan['database_snapshots'] if r['type'] == 'directory']
+                if directories:
+                    remote(plan, 'mkdir', paths=directories)
+                persistent += [codex / name for name in ['.codex-global-state.json', '.codex-global-state.json.bak', 'session_index.jsonl'] if (codex / name).is_file()]
+                persistent += [Path(p) for p in plan.get('desktop_archives', desktop_archives(plan['source_home']))]
+                persistent += [Path(p) for p in plan.get('frozen_files', [])]
+                for source in persistent:
+                    snapshot = location / 'persistent-snapshot'
+                    info = snapshot_file(source, snapshot, preserve_mode=str(source) in plan.get('frozen_files', []))
+                    relative = source.relative_to(plan['source_home']).as_posix()
+                    remote(plan, 'mkdir', paths=[str(Path(relative).parent)])
+                    rsync(plan, snapshot, plan['root'] + '/incoming/' + relative, log)
+                    plan['database_snapshots'].append({'path': relative, 'type': 'file', **info})
+                    save(plan)
+                    snapshot.unlink()
+                save(plan, captured_at=time.time())
             save(plan, phase='manifest', detail='流式计算来源 SHA-256 清单；内存使用不随文件总大小增长')
             manifest = make_manifest(plan)
             save(plan, phase='reconcile', detail='核对初次复制后的文件差异')
@@ -556,6 +564,7 @@ def start(ident):
         raise ValueError('当前阶段无需重新传输')
     if plan.get('phase') in {'databases', 'manifest', 'reconcile', 'verify'}:
         plan['skip_initial_copy'] = True
+        plan['reuse_snapshots'] = plan['phase'] != 'databases' and bool(plan.get('captured_at'))
         plan.setdefault('desktop_archives', desktop_archives(plan['source_home']))
         save(plan)
     elif plan.get('phase') == 'copy':
@@ -592,12 +601,41 @@ def _activation_worker(ident, activate=False):
     try:
         save(plan, status='preparing_activation', detail='在远端副本中合并会话、项目和记忆；保留目标原有资料')
         action = 'activate' if activate else 'prepare_activation'
-        report = remote(plan, action, timeout=24 * 3600, roots=plan['roots'], allow_app_restart=activate, refresh=not activate)
+        if not activate:
+            capture_external_attachments(plan)
+        report = remote(plan, action, timeout=24 * 3600, roots=plan['roots'], allow_app_restart=activate,
+                        refresh=not activate, attachments_sha256=plan.get('external_attachments', {}).get('manifest_sha256'))
         save(plan, status='activated_pending_acceptance' if activate else 'activation_prepared',
              activation=report, detail='已接入目标 Codex，待原生功能验收' if activate else '接续副本已准备，原有环境尚未切换')
     except BaseException as exc:
         save(plan, status='activation_failed', detail=str(exc)[:3000])
         raise
+
+
+def capture_external_attachments(plan):
+    refs = remote(plan, 'attachment_references', timeout=120)
+    roots = [Path(r['source']) for r in plan['roots']]
+    remote(plan, 'prepare_attachment_inputs')
+    result = {'files': [], 'missing_external_paths': [], 'captured_at': time.time()}
+    location = folder(plan['id'])
+    for row in refs:
+        path = Path(row['path'])
+        if any(path.is_relative_to(r) for r in roots):
+            continue
+        if not path.is_file():
+            result['missing_external_paths'].append(row)
+            continue
+        snapshot = location / 'attachment-snapshot'
+        info = snapshot_file(path, snapshot)
+        name = hashlib.sha256(str(path).encode()).hexdigest()[:20] + '-' + info['sha256'][:20] + path.suffix[:12]
+        rsync(plan, snapshot, plan['root'] + '/supplements/attachments/' + name, location / 'attachments-transfer.log')
+        result['files'].append({'source': str(path), 'name': name, **info})
+        snapshot.unlink()
+    manifest = location / 'attachment-inputs.json'
+    agent.atomic_json(manifest, result)
+    rsync(plan, manifest, plan['root'] + '/evidence/attachment-inputs.json', location / 'attachments-transfer.log')
+    save(plan, external_attachments={'copied': len(result['files']),
+         'missing_before_migration': len(result['missing_external_paths']), 'manifest_sha256': agent.digest(manifest)})
 
 
 def start_activation(ident, activate=False):
@@ -649,7 +687,8 @@ def reports(ident):
             raise ValueError('接收回执与任务不匹配')
         return {p.name: json.loads(p.read_text()) for p in (root / 'evidence').glob('*.json')
                 if p.name in {'verification.json', 'activation.json', 'native-acceptance.json',
-                              'atlas-deployment.json', 'workspace-acceptance.json', 'completion.json'}}
+                              'atlas-deployment.json', 'workspace-acceptance.json', 'completion.json',
+                              'attachment-recovery.json', 'attachment-recovery-progress.json'}}
     return remote(plan, 'report')
 
 
