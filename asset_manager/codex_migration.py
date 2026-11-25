@@ -49,7 +49,19 @@ def folder(ident):
 
 
 def read(ident):
-    return json.loads((folder(ident) / 'plan.json').read_text(encoding='utf-8'))
+    value=json.loads((folder(ident) / 'plan.json').read_text(encoding='utf-8'))
+    if value.get('role')=='receiver':
+        receipts=receiver_reports(value)
+        for field,name in {'result':'verification.json','activation':'activation.json',
+            'native_acceptance':'native-acceptance.json','workspace_acceptance':'workspace-acceptance.json',
+            'atlas_deployment':'atlas-deployment.json','history_maintenance':'history-maintenance.json',
+            'completion':'completion.json'}.items():
+            if name in receipts:value[field]=receipts[name]
+        if receipts.get('completion.json',{}).get('status')=='complete':
+            value['detail']='本机接收内容已通过迁移验收；下列状态读取本机最新回执，来源与原始副本保留'
+        if value.get('history_maintenance',{}).get('status')=='installed' and value.get('finished_history'):
+            value['finished_history']['status']='installed'
+    return value
 
 
 def save(plan, **updates):
@@ -71,6 +83,7 @@ def listing():
     result = []
     for p in sorted((db.DATA / 'codex-migrations').glob('*/plan.json'), key=lambda p: p.stat().st_mtime, reverse=True):
         value = json.loads(p.read_text(encoding='utf-8'))
+        if value.get('role')=='receiver':value=read(value['id'])
         if value.get('role') == 'tool_supplement':
             continue  # Supplemental receipts are presented by their parent task.
         result.append({k: value.get(k) for k in ['id', 'name', 'status', 'phase', 'detail', 'host', 'root',
@@ -817,19 +830,22 @@ def deploy_atlas(ident, port=8765):
     return report
 
 
+def receiver_reports(plan):
+    root=agent.checked_root(plan['root'])
+    if json.loads((root/'ATLAS-MIGRATION.json').read_text())['id']!=plan['id']:
+        raise ValueError('接收回执与任务不匹配')
+    names={'verification.json','activation.json','native-acceptance.json',
+        'atlas-deployment.json','workspace-acceptance.json','completion.json',
+        'attachment-recovery.json','attachment-recovery-progress.json',
+        'tool-verification.json','tool-installation.json','python-runtime-rebinding.json',
+        'python-runtime-acceptance.json','rollout-path-rebinding.json','history-maintenance.json',
+        'finished-history-acceptance.json','workspace-delta-acceptance.json','git-upgrades.json'}
+    return {p.name:json.loads(p.read_text()) for p in (root/'evidence').glob('*.json') if p.name in names}
+
+
 def reports(ident):
-    plan = read(ident)
-    if plan.get('role') == 'receiver':
-        root = agent.checked_root(plan['root'])
-        marker = json.loads((root / 'ATLAS-MIGRATION.json').read_text())
-        if marker['id'] != ident:
-            raise ValueError('接收回执与任务不匹配')
-        return {p.name: json.loads(p.read_text()) for p in (root / 'evidence').glob('*.json')
-                if p.name in {'verification.json', 'activation.json', 'native-acceptance.json',
-                              'atlas-deployment.json', 'workspace-acceptance.json', 'completion.json',
-                              'attachment-recovery.json', 'attachment-recovery-progress.json',
-                              'tool-verification.json', 'tool-installation.json', 'python-runtime-rebinding.json', 'python-runtime-acceptance.json', 'rollout-path-rebinding.json','history-maintenance.json','finished-history-acceptance.json'}}
-    return remote(plan, 'report')
+    plan=read(ident)
+    return receiver_reports(plan) if plan.get('role')=='receiver' else remote(plan,'report')
 
 
 def install_tools(ident, supplement_id):

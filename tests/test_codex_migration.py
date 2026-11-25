@@ -671,3 +671,19 @@ def test_exclusion_boundaries_and_resume_reuse_complete_snapshots(env,monkeypatc
     saved=migration.read(ident)
     assert saved['reuse_snapshots'] and saved['skip_initial_copy']
     assert saved['database_snapshots']==plan['database_snapshots']
+
+
+def test_receiver_refreshes_local_receipts_without_ssh(env,monkeypatch):
+    ident='c'*32;root=env/'receiver';(root/'evidence').mkdir(parents=True)
+    (root/'ATLAS-MIGRATION.json').write_text(json.dumps({'id':ident}))
+    monkeypatch.setattr(agent,'checked_root',lambda value:Path(value))
+    migration.save({'id':ident,'role':'receiver','status':'received','root':str(root),
+        'native_acceptance':{'status':'old_sampled'}})
+    (root/'evidence/native-acceptance.json').write_text(json.dumps({'status':'passed','full_history':{'items_checked':267193}}))
+    (root/'evidence/completion.json').write_text(json.dumps({'status':'complete'}))
+    current=migration.read(ident)
+    assert current['native_acceptance']['full_history']['items_checked']==267193
+    assert current['status']=='received' and '最新回执' in current['detail']
+    assert migration.listing()[0]['detail']==current['detail']
+    (root/'ATLAS-MIGRATION.json').write_text(json.dumps({'id':'wrong'}))
+    with pytest.raises(ValueError,match='不匹配'):migration.read(ident)
