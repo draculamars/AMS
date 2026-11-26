@@ -3,6 +3,7 @@ import copy
 import json
 import shutil
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -105,3 +106,41 @@ def test_audit_reads_native_bytes_and_separately_reports_missing_resources(tmp_p
     assert not report['visual_rendering_verified']
     client.corrupt=True
     assert links.audit(home, '/old', '/new', client)['status']=='failed'
+
+
+@pytest.mark.parametrize('condition', ['repair', 'unknown_target', 'working_target', 'changed_version', 'failed_start'])
+def test_recorded_runtime_repair_preserves_independent_changes_and_rolls_back(tmp_path, monkeypatch, condition):
+    import os
+    import platform
+    from asset_manager import migration_tools, migration_agent as agent
+    home=tmp_path/'home'; root=tmp_path/'migration'; (root/'evidence').mkdir(parents=True)
+    relative='project/.venv/bin/python3.14'; path=home/relative; path.parent.mkdir(parents=True)
+    runtime=home/'runtime/bin/python3.14'; runtime.parent.mkdir(parents=True); runtime.write_bytes(b'runtime')
+    before='/unavailable/homebrew/python3.14'
+    target=before if condition not in {'unknown_target','working_target'} else '/independent/missing-python'
+    if condition=='working_target':
+        target=str(home/'independent-python'); Path(target).write_bytes(b'working')
+    path.symlink_to(target)
+    config=path.parent.parent/'pyvenv.cfg'
+    config.write_text('home = /unavailable/homebrew\nversion = '+('3.14.4' if condition=='changed_version' else '3.14.3')+'\ncustom = preserve\n')
+    original=config.read_bytes()
+    manifest=root/'evidence/source-manifest.jsonl'; manifest.write_text('{}\n')
+    agent.atomic_json(root/'evidence/python-runtime-rebinding.json', {'status':'prepared','unresolved':[],
+        'manifest_sha256':agent.digest(manifest),'changes':[{'path':relative,'before':before,'after':str(runtime),
+        'version':[3,14,3],'soabi':'fixture-abi','environment':'project/.venv'}]})
+    def identity(p):
+        if Path(p)==path and condition=='failed_start':raise ValueError('start failure')
+        return {'version':[3,14,3],'soabi':'fixture-abi','architecture':platform.machine(),
+            'base_prefix':str(runtime.parent.parent),'prefix':str(path.parent.parent if Path(p)==path else runtime.parent.parent)}
+    monkeypatch.setattr(migration_tools,'python_identity',identity)
+    if condition in {'unknown_target','changed_version','failed_start'}:
+        with pytest.raises(ValueError):migration_tools.repair_active_python_links(root,home,agent,profile)
+        assert os.readlink(path)==target and config.read_bytes()==original
+    else:
+        r=migration_tools.repair_active_python_links(root,home,agent,profile)
+        assert r['status']=='passed'
+        assert os.readlink(path)==(str(runtime) if condition=='repair' else target)
+        assert len(r['repairs'])==(1 if condition=='repair' else 0)
+        if condition=='repair':
+            assert (Path(r['repairs'][0]['backup'])/'pyvenv.cfg').read_bytes()==original
+            assert 'custom = preserve' in config.read_text()

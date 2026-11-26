@@ -255,6 +255,78 @@ def repair_python_links(root, home, agent, profile, active=False):
     return report
 
 
+def repair_active_python_links(root, home, agent, profile):
+    """Restore only a recorded, broken interpreter binding; preserve working venvs."""
+    import uuid
+    import re
+    import platform
+    root, home = Path(root), Path(home)
+    report = json.loads((root / 'evidence/python-runtime-rebinding.json').read_text())
+    if report.get('manifest_sha256') != agent.digest(root / 'evidence/source-manifest.jsonl'):
+        raise ValueError('运行环境记录与原始迁移清单不一致')
+    repairs = []
+    backup = root / 'evidence' / ('runtime-link-repair-' + uuid.uuid4().hex)
+    for row in report['changes']:
+        relative = Path(row['path'])
+        path = home / relative
+        if relative.is_absolute() or '..' in relative.parts or not path.parent.resolve().is_relative_to(home.resolve()):
+            raise ValueError('运行环境路径越界')
+        if path.exists():
+            continue  # A user-selected working interpreter is never overwritten.
+        if not path.is_symlink() or os.readlink(path) not in {row['before'], row['after']}:
+            raise ValueError('运行环境已经独立修改，拒绝覆盖：' + str(path))
+        runtime = Path(row['after'])
+        identity = python_identity(runtime)
+        if identity['version'] != row['version'] or identity['soabi'] != row['soabi'] or identity['architecture'] != platform.machine():
+            raise ValueError('已记录运行时的版本或 ABI 不一致')
+        config = path.parent.parent / 'pyvenv.cfg'
+        original = config.read_bytes()
+        text = original.decode()
+        version = re.search(r'(?m)^version(?:_info)?\s*=\s*(\d+)\.(\d+)\.(\d+)', text)
+        if not version or list(map(int, version.groups())) != row['version']:
+            raise ValueError('虚拟环境版本已经改变，拒绝覆盖：' + str(config))
+        replacements = {'home': str(runtime.parent), 'executable': str(runtime), 'base-executable': str(runtime),
+                        'base-prefix': identity['base_prefix'], 'base-exec-prefix': identity['base_prefix']}
+        lines = []
+        for line in text.splitlines(keepends=True):
+            key, separator, value = line.partition('=')
+            if separator and key.strip() in replacements:
+                value = value.replace(value.strip(), replacements[key.strip()], 1)
+            lines.append(key + separator + value)
+        previous = os.readlink(path)
+        saved = backup / relative.parent.parent
+        saved.mkdir(parents=True, exist_ok=True, mode=0o700)
+        (saved / 'pyvenv.cfg').write_bytes(original)
+        agent.atomic_json(saved / 'binding.json', {'path':str(path), 'target':previous})
+        temporary = path.with_name(path.name + '.atlas-' + uuid.uuid4().hex)
+        replacement = ''.join(lines)
+        written = False
+        try:
+            if config.read_bytes() != original or os.readlink(path) != previous:
+                raise ValueError('修复前运行环境发生变化')
+            temporary.symlink_to(runtime)
+            profile.write_copy(config, replacement)
+            written = True
+            os.replace(temporary, path)
+            check = python_identity(path)
+            if check['version'] != row['version'] or Path(check['prefix']) != home / row['environment']:
+                raise ValueError('修复后解释器版本或环境前缀不一致')
+        except BaseException:
+            if path.is_symlink() and os.readlink(path) == str(runtime):
+                temporary.unlink(missing_ok=True); temporary.symlink_to(previous); os.replace(temporary, path)
+            if written and config.read_text() == replacement:
+                profile.write_copy(config, original.decode())
+            raise
+        finally:
+            temporary.unlink(missing_ok=True)
+        repairs.append({'path': str(path), 'before': previous, 'after': str(runtime), 'backup': str(saved)})
+        agent.atomic_json(backup / 'receipt.json', {'repairs': repairs, 'status':'repairing'})
+    result = verify_python_links(root, home, agent)
+    result.update(repairs=repairs, backup=str(backup) if repairs else None)
+    agent.atomic_json(root / 'evidence/runtime-link-repair.json', result)
+    return result
+
+
 def verify_python_links(root, home, agent):
     root, home = Path(root), Path(home)
     prepared = json.loads((root / 'evidence/python-runtime-rebinding.json').read_text())

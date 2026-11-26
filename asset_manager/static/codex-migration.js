@@ -62,6 +62,7 @@ export async function mountCodexMigration(host, {api, toast}) {
     if(['complete','native_verified','activated_pending_acceptance'].includes(plan.status)) {
       const controls=document.createElement('div');controls.className='actions';
       controls.innerHTML='<button class="secondary" data-history-prepare>准备历史与资源链接修复</button><button class="secondary" data-capture-finished>捕获已结束会话的补同步内容</button>'+
+        (plan.native_acceptance?.python_runtimes?.status==='failed'?'<button class="secondary" data-runtime-repair>修复已记录的失效解释器链接</button>':'')+
         (plan.finished_history?.status==='captured'&&['prepared','validated','validation_failed'].includes(plan.history_maintenance?.status)?'<button class="secondary" data-apply-finished>合入隔离副本并检查冲突</button>':'')+
         (['prepared','validated','validation_failed'].includes(plan.history_maintenance?.status)?'<button class="secondary" data-history-verify>全量验证隔离副本</button>':'')+
         (plan.history_maintenance?.status==='validated'?'<button class="primary" data-history-install>保留当前副本，重启目标并接入修复</button>':'');
@@ -79,6 +80,7 @@ export async function mountCodexMigration(host, {api, toast}) {
     }
     action('[data-deploy]','deploy-atlas',{},'目标 Atlas 服务已启动');
     action('[data-native]','verify-native',{},'原生会话验收完成');
+    action('[data-runtime-repair]','repair-runtimes',{},'解释器链接检查完成，请重新进行原生验收');
     action('[data-workspaces]','verify-workspaces',{},'工程与 Git 校验完成');
     action('[data-complete]','complete',{},'迁移验收通过，来源和原始快照保留');
     action('[data-history-prepare]','prepare-history',{},'历史修复副本已准备，当前目标环境保留');

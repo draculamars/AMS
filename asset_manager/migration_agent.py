@@ -903,6 +903,7 @@ def accept_native(body):
         result['python_runtimes'] = runtime_tools.verify_python_links(root, Path.home(), sys.modules[__name__])
         if result['python_runtimes']['status'] != 'passed':
             result['status'] = 'failed'
+            result['errors'].append({'component': 'python_runtimes', 'error': '迁移记录中的 Python 环境未通过复验'})
     recovered = root / 'evidence/attachment-recovery.json'
     if recovered.exists():
         recovery = json.loads(recovered.read_text())
@@ -1072,9 +1073,15 @@ def main():
         import atlas_migration_tools as runtime_tools
         root = checked_root(body['root'])
         activation = json.loads((root / 'evidence/activation.json').read_text())
-        if activation['status'] != 'prepared':
+        if activation['status'] in {'activated_pending_acceptance', 'accepted'}:
+            with profile.connection(Path.home() / '.codex/thread_history_1.sqlite') as c:
+                if c.execute("SELECT count(*) FROM thread_turns WHERE status NOT IN ('completed','failed','interrupted')").fetchone()[0]:
+                    raise ValueError('目标有活动会话，暂不修改运行环境')
+            result = runtime_tools.repair_active_python_links(root, Path.home(), sys.modules[__name__], profile)
+        elif activation['status'] != 'prepared':
             raise ValueError('运行环境重绑定只能在准备副本中执行')
-        result = runtime_tools.repair_python_links(root, Path.home(), sys.modules[__name__], profile)
+        else:
+            result = runtime_tools.repair_python_links(root, Path.home(), sys.modules[__name__], profile)
         activation['python_runtimes'] = result
         atomic_json(root / 'evidence/activation.json', activation)
     elif action == 'verify_workspaces':

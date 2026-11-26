@@ -935,10 +935,13 @@ def finished_history_drift(plan):
 
 def repair_runtimes(ident):
     plan = read(ident)
-    if plan['status'] != 'activation_prepared':
+    if plan['status'] not in {'activation_prepared', 'activated_pending_acceptance', 'native_verified', 'complete'}:
         raise ValueError('请先准备接续副本')
     report = remote(plan, 'repair_runtimes', timeout=600)
-    plan['activation']['python_runtimes'] = report
+    plan.setdefault('activation', {})['python_runtimes'] = report
+    if report.get('repairs') and plan['status'] != 'activation_prepared':
+        plan.update(status='activated_pending_acceptance', native_acceptance=None,
+                    detail='已修复失效解释器链接，等待完整原生验收')
     save(plan)
     return report
 

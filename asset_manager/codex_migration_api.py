@@ -63,6 +63,11 @@ def verify_workspaces(ident: str):
     return migration.verify_workspaces(ident)
 
 
+@router.post('/api/codex-migrations/{ident}/repair-runtimes')
+def repair_runtimes(ident: str):
+    return migration.repair_runtimes(ident)
+
+
 @router.post('/api/codex-migrations/{ident}/complete')
 def complete(ident: str):
     return migration.complete(ident)
