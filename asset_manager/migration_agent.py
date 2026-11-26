@@ -704,7 +704,7 @@ def _history_maintenance(body):
         if recovery.exists():
             aliases.update(json.loads(recovery.read_text()).get('aliases', {}))
         report['item_path_repairs'] = history.repair_item_paths(staged, marker['source_home'], str(Path.home()), aliases)
-        report['rollout_repairs'] = profile.repair_rollout_metadata(staged, marker['source_home'], str(Path.home()))
+        report['rollout_repairs'] = profile.repair_rollout_metadata(staged, marker['source_home'], str(Path.home()), aliases=aliases)
         if report['rollout_repairs']['status'] != 'prepared':
             raise ValueError('日志存在未处理记录，禁止激活')
         report['preservation'] = history.preservation(before, staged, marker['source_home'], str(Path.home()), aliases)
@@ -782,11 +782,12 @@ def _history_maintenance(body):
             raise ValueError('请先准备历史修复副本')
         with profile.connection(staged / 'state_5.sqlite') as c:
             ids = [r[0] for r in c.execute('SELECT id FROM threads')]
-        result = profile.native_acceptance(staged, runroot, ids, [], full=True)
+        result = profile.native_acceptance(staged, runroot, ids, [], full=True,
+            source_home=marker['source_home'], target_home=str(Path.home()))
         atomic_json(runroot / 'native-acceptance.json', result)
         report.update(status='validated' if result['status'] == 'passed' else 'validation_failed',
                       native_status=result['status'], validated_at=time.time(),
-                      full_history=result.get('full_history'), offsets=result.get('offsets'))
+                      full_history=result.get('full_history'), offsets=result.get('offsets'), local_links=result.get('local_links'))
         # Full reports stay in the run directory; the receipt is intentionally bounded.
         report['full_history'] = {k:v for k,v in (result.get('full_history') or {}).items() if k!='threads'}
         report['offsets'] = {k:v for k,v in (result.get('offsets') or {}).items() if k!='branches'}
@@ -896,7 +897,8 @@ def accept_native(body):
         with profile.connection(path) as c:
             return [r[0] for r in c.execute('SELECT id FROM threads')]
     result = profile.native_acceptance(Path.home() / '.codex', root / 'evidence',
-        ids(root / 'incoming/.codex/state_5.sqlite'), ids(root / 'destination-original-codex/state_5.sqlite'), full=True)
+        ids(root / 'incoming/.codex/state_5.sqlite'), ids(root / 'destination-original-codex/state_5.sqlite'), full=True,
+        source_home=json.loads((root / 'ATLAS-MIGRATION.json').read_text())['source_home'], target_home=str(Path.home()))
     if (root / 'evidence/python-runtime-rebinding.json').exists():
         result['python_runtimes'] = runtime_tools.verify_python_links(root, Path.home(), sys.modules[__name__])
         if result['python_runtimes']['status'] != 'passed':
@@ -1099,6 +1101,8 @@ def main():
         if any(r['status'] != 'passed' for r in checks.values()):
             raise ValueError('仍有验收未通过')
         native = checks['native-acceptance.json']
+        if (native.get('local_links') or {}).get('status') != 'passed' or not (native.get('local_links') or {}).get('native_checked'):
+            raise ValueError('缺少聊天资源链接与原生媒体读取验收')
         if (native.get('full_history') or {}).get('status') != 'passed' or (native.get('offsets') or {}).get('status') != 'passed':
             raise ValueError('缺少全量历史字段与日志偏移验收，旧版抽样报告不能完成迁移')
         boundary=body.get('finished_history_acceptance',{})

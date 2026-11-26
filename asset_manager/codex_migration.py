@@ -23,7 +23,7 @@ import time
 import uuid
 import zlib
 from pathlib import Path
-from . import db, migration_agent as agent, codex_profile, codex_attachments, migration_tools, codex_history
+from . import db, migration_agent as agent, codex_profile, codex_attachments, migration_tools, codex_history, codex_links
 
 CODEx_TRANSIENT = {'ipc', 'tmp', '.tmp', 'app-server-control', 'thread-writer-locks',
                    'project-metadata-locks', 'process_manager', 'shell_snapshots',
@@ -114,7 +114,9 @@ def remote(plan, action, timeout=90, **body):
     attachments = base64.b64encode(zlib.compress(Path(codex_attachments.__file__).read_bytes(), 9)).decode()
     runtime_tools = base64.b64encode(zlib.compress(Path(migration_tools.__file__).read_bytes(), 9)).decode()
     history = base64.b64encode(zlib.compress(Path(codex_history.__file__).read_bytes(), 9)).decode()
-    program = ("import base64,zlib,types,sys;h=types.ModuleType('atlas_codex_history');sys.modules[h.__name__]=h;"
+    links = base64.b64encode(zlib.compress(Path(codex_links.__file__).read_bytes(), 9)).decode()
+    program = ("import base64,zlib,types,sys;l=types.ModuleType('atlas_codex_links');sys.modules[l.__name__]=l;"
+               "exec(zlib.decompress(base64.b64decode('" + links + "')),l.__dict__);h=types.ModuleType('atlas_codex_history');sys.modules[h.__name__]=h;"
                "exec(zlib.decompress(base64.b64decode('" + history + "')),h.__dict__);a=types.ModuleType('atlas_codex_attachments');sys.modules[a.__name__]=a;"
                "exec(zlib.decompress(base64.b64decode('" + attachments + "')),a.__dict__);m=types.ModuleType('atlas_codex_profile');"
                "sys.modules[m.__name__]=m;exec(zlib.decompress(base64.b64decode('" + profile + "')),m.__dict__);"
@@ -974,6 +976,8 @@ def complete(ident):
     native = receipt['native-acceptance.json']
     if (native.get('full_history') or {}).get('status') != 'passed' or (native.get('offsets') or {}).get('status') != 'passed':
         raise ValueError('需要全量历史字段与日志偏移验收；旧版抽样报告不能完成迁移')
+    if (native.get('local_links') or {}).get('status') != 'passed' or not (native.get('local_links') or {}).get('native_checked'):
+        raise ValueError('需要聊天资源链接与原生媒体读取验收；旧报告不能完成迁移')
     drift=finished_history_drift(plan)
     if drift['status']!='passed':
         raise ValueError('来源有已结束但尚未接入的轮次；请捕获并验证尾差：'+str(len(drift['unmerged_closed_turns'])))

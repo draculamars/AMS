@@ -24,12 +24,18 @@ def sha(path):
 
 
 def references(database):
+    import sys
+    links = sys.modules.get('atlas_codex_links')
+    if links is None:
+        from . import codex_links as links
     found = {}
     with sqlite3.connect(Path(database).as_uri() + '?mode=rw', uri=True) as c:
         c.execute('PRAGMA query_only=ON')
-        for kind, raw in c.execute("SELECT item_type,item_json FROM thread_items WHERE item_type IN ('userMessage','imageView')"):
+        for kind, raw in c.execute("SELECT item_type,item_json FROM thread_items WHERE item_type IN ('userMessage','imageView','agentMessage')"):
             item = json.loads(raw)
             values = [item.get('path')] if kind == 'imageView' else [v.get('path') for v in item.get('content', []) if v.get('type') == 'localImage']
+            if kind == 'agentMessage':
+                values = [r['path'] for r in links.resources(item.get('text', '')) if r['media'] != 'file']
             for value in values:
                 if isinstance(value, str) and Path(value).is_absolute():
                     found.setdefault(value, set()).add(kind)
@@ -37,13 +43,13 @@ def references(database):
 
 
 def relocate_item(item, source_home, target_home, aliases=None):
-    if item.get('type') not in {'userMessage','imageView','fileChange','commandExecution'}:
+    if item.get('type') not in {'userMessage','imageView','fileChange','commandExecution','agentMessage'}:
         return copy.deepcopy(item)
     import sys
     history = sys.modules.get('atlas_codex_history')
     if history is None:
         from . import codex_history as history
-    return history.mapped_paths(item, source_home, target_home, aliases)
+    return history.mapped_item(item, source_home, target_home, aliases)
 
 
 def embedded_images(record):

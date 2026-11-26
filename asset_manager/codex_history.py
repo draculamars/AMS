@@ -15,6 +15,7 @@ import shutil
 import uuid
 import contextlib
 import io
+import sys
 from pathlib import Path
 
 UUID = re.compile(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}')
@@ -24,6 +25,21 @@ PATH_KEYS = {'cwd', 'path', 'root', 'roots', 'writable_roots', 'image_path',
     'rollout_path', 'rootPaths', 'writableRoots', 'filePath', 'localPath',
     'common_dir', 'checkout_root', 'repo_root', 'runtime_workspace_roots',
     'move_path', 'movePath', 'scriptPath'}
+
+
+def links_module():
+    module = sys.modules.get('atlas_codex_links')
+    if module is None:
+        from . import codex_links as module
+    return module
+
+
+def mapped_item(value, source_home, target_home, aliases=None):
+    if value.get('type') == 'agentMessage':
+        return links_module().item(value, source_home, target_home, aliases)
+    if value.get('type') in {'commandExecution', 'fileChange', 'imageView', 'userMessage'}:
+        return mapped_paths(value, source_home, target_home, aliases)
+    return value
 
 
 def mapped_paths(value, source_home, target_home, aliases=None, key=''):
@@ -303,10 +319,10 @@ def repair_item_paths(codex_home, source_home, target_home, aliases=None):
     changed = collections.Counter()
     with sqlite3.connect(Path(codex_home) / 'thread_history_1.sqlite') as c:
         c.execute('BEGIN IMMEDIATE')
-        rows = c.execute("SELECT thread_id,turn_id,item_id,item_type,item_json FROM thread_items WHERE item_type IN ('commandExecution','fileChange','imageView','userMessage')")
+        rows = c.execute("SELECT thread_id,turn_id,item_id,item_type,item_json FROM thread_items WHERE item_type IN ('commandExecution','fileChange','imageView','userMessage','agentMessage')")
         for thread, turn, item, kind, raw in rows:
             original = json.loads(raw)
-            mapped = mapped_paths(original, source_home, target_home, aliases)
+            mapped = mapped_item(original, source_home, target_home, aliases)
             if mapped != original:
                 c.execute('UPDATE thread_items SET item_json=? WHERE thread_id=? AND turn_id=? AND item_id=?',
                     (json.dumps(mapped, ensure_ascii=False, separators=(',', ':')), thread, turn, item))
@@ -360,8 +376,7 @@ def preservation(before, after, source_home, target_home, aliases=None):
                     expected.pop(key, None); actual.pop(key, None)
                 if 'item_json' in expected:
                     parsed = json.loads(expected['item_json'])
-                    expected['item_json'] = mapped_paths(parsed, source_home, target_home, aliases) if parsed.get('type') in {
-                        'commandExecution','fileChange','imageView','userMessage'} else parsed
+                    expected['item_json'] = mapped_item(parsed, source_home, target_home, aliases)
                     actual['item_json'] = json.loads(actual['item_json'])
                 if expected != actual:
                     if len(errors) < 40:
@@ -370,7 +385,7 @@ def preservation(before, after, source_home, target_home, aliases=None):
             if next(right, None) is not None:
                 errors.append({'table': table, 'reason': 'unexpected_added_row'})
     return {'status': 'failed' if errors else 'passed', 'checked_rows': counts, 'errors': errors,
-            'scope': 'every_preexisting_target_row_only_declared_typed_paths_and_offsets_may_change'}
+            'scope': 'every_preexisting_target_row_only_typed_paths_markdown_destinations_and_offsets_may_change'}
 
 
 def log_signature(home):
@@ -528,7 +543,7 @@ def merge_finished(codex_home, package, target_home, aliases=None):
             try:
                 raw_old,old=record(target)
                 def comparable(value):
-                    value=mapped_paths(value,source_home,target_home,aliases)
+                    value=links_module().record(mapped_paths(value,source_home,target_home,aliases),source_home,target_home,aliases) if value else value
                     if value and value.get('type')=='session_meta':
                         # This is a derived byte coordinate in the parent log.
                         # Parent identity and the ordinal boundary remain exact.
@@ -539,7 +554,7 @@ def merge_finished(codex_home, package, target_home, aliases=None):
                     while True:
                         raw,new=record(src)
                         if not raw:break
-                        normalized=mapped_paths(new,source_home,target_home,aliases)
+                        normalized=links_module().record(mapped_paths(new,source_home,target_home,aliases),source_home,target_home,aliases)
                         while old is not None and comparable(old)!=comparable(new):
                             if old.get('payload',{}).get('type')!='thread_settings_applied':
                                 raise ValueError('目标存在分叉的历史内容，拒绝覆盖：'+ident+' ordinal='+str(old.get('ordinal')))
@@ -567,14 +582,16 @@ def merge_finished(codex_home, package, target_home, aliases=None):
                     keys=[r[1] for r in sorted(schema,key=lambda r:r[5]) if r[5]]
                     if table=='thread_items':
                         item=json.loads(row['item_json'])
-                        row['item_json']=json.dumps(mapped_paths(item,source_home,target_home,aliases) if item.get('type') in {'commandExecution','fileChange','imageView','userMessage'} else item,ensure_ascii=False,separators=(',',':'))
+                        row['item_json']=json.dumps(mapped_item(item,source_home,target_home,aliases),ensure_ascii=False,separators=(',',':'))
                     if table=='thread_turns' and row['status'] not in {'completed','failed','interrupted'}:row['status']='interrupted'
                     where=' AND '.join(k+'=?' for k in keys)
                     oldrow=c.execute('SELECT * FROM '+table+' WHERE '+where,[row[k] for k in keys]).fetchone()
                     if oldrow and table!='thread_history_projection_state':
                         want,got=dict(row),dict(oldrow)
                         for field in ['rollout_byte_offset','rollout_end_byte_offset']:want.pop(field,None);got.pop(field,None)
-                        if table=='thread_items':want['item_json']=json.loads(want['item_json']);got['item_json']=json.loads(got['item_json'])
+                        if table=='thread_items':
+                            want['item_json']=json.loads(want['item_json'])
+                            got['item_json']=mapped_item(json.loads(got['item_json']),source_home,target_home,aliases)
                         old_parent=prior_turns.get(row['turn_id'])
                         if want!=got and old_parent and old_parent['completed_at'] is not None:
                             raise ValueError('目标已结束内容与来源不同，拒绝覆盖：'+str([row[k] for k in keys]))

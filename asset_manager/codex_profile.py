@@ -209,7 +209,7 @@ def merge_database(source, existing, output, tables, source_home, target_home, a
                             mapped = map_json_paths(value, source_home, target_home)
                             if mapped != value:
                                 row[col] = json.dumps(mapped, ensure_ascii=False, separators=(',', ':'))
-                    if table == 'thread_items' and row.get('item_type') in {'userMessage', 'imageView', 'fileChange', 'commandExecution'}:
+                    if table == 'thread_items' and row.get('item_type') in {'userMessage', 'imageView', 'fileChange', 'commandExecution', 'agentMessage'}:
                         item = json.loads(row['item_json'])
                         mapped = attachments.relocate_item(item, source_home, target_home, attachment_paths)
                         if mapped != item:
@@ -281,7 +281,7 @@ def write_copy(path, content):
             path.write_text(content)
 
 
-def repair_rollout_metadata(codex_home, source_home, target_home, max_record_bytes=128 * 1024**2):
+def repair_rollout_metadata(codex_home, source_home, target_home, max_record_bytes=128 * 1024**2, aliases=None):
     """Rebind typed session metadata in a derived profile, preserving prose bytes.
 
     Codex can rebuild SQLite cwd from JSONL metadata on startup. Both stores must
@@ -317,17 +317,18 @@ def repair_rollout_metadata(codex_home, source_home, target_home, max_record_byt
                                     break
                                 dst.write(raw)
                             continue
-                        # Only the top-level discriminator near the start is
-                        # eligible. Message/tool bodies are never rewritten.
-                        if re.search(rb'"type"\s*:\s*"(?:session_meta|turn_context|event_msg)"', raw[:256]):
+                        # Rebase structured metadata and assistant Markdown URLs;
+                        # tool calls, prose and code examples remain unchanged.
+                        if re.search(rb'"type"\s*:\s*"(?:session_meta|turn_context|event_msg|response_item)"', raw[:256]):
                             try:
                                 record = json.loads(raw)
+                                original = record
                                 if record.get('type') in {'session_meta', 'turn_context', 'event_msg'}:
-                                    mapped = map_json_paths(record.get('payload'), source_home, target_home)
-                                    if mapped != record.get('payload'):
-                                        record['payload'] = mapped
-                                        raw = json.dumps(record, ensure_ascii=False, separators=(',', ':')).encode() + (b'\n' if raw.endswith(b'\n') else b'')
-                                        count += 1
+                                    record = {**record, 'payload': history_module().mapped_paths(record.get('payload'), source_home, target_home, aliases)}
+                                record = history_module().links_module().record(record, source_home, target_home, aliases)
+                                if record != original:
+                                    raw = json.dumps(record, ensure_ascii=False, separators=(',', ':')).encode() + (b'\n' if raw.endswith(b'\n') else b'')
+                                    count += 1
                             except (ValueError, UnicodeError):
                                 warnings.append({'path': str(path), 'line': line_number, 'reason': 'invalid_metadata_json'})
                         dst.write(raw)
@@ -507,7 +508,7 @@ class NativeCodex:
         self.log.close()
 
 
-def native_acceptance(codex_home, evidence, source_ids, destination_ids, full=False):
+def native_acceptance(codex_home, evidence, source_ids, destination_ids, full=False, source_home=None, target_home=None):
     codex_home, evidence = Path(codex_home), Path(evidence)
     candidates = [Path('/Applications') / (app + '.app/Contents/Resources/codex-cli/bin/codex') for app in ['ChatGPT', 'Codex']]
     found = shutil.which('codex')
@@ -603,7 +604,7 @@ def native_acceptance(codex_home, evidence, source_ids, destination_ids, full=Fa
                 errors.append({'component': 'resume_or_skills', 'error': str(exc)})
         elif source_ids:
             errors.append({'component': 'resume', 'error': '没有可接续的迁入工程目录'})
-        comprehensive, offsets = None, None
+        comprehensive, offsets, local_links = None, None, None
         if full:
             def progress(value):
                 path = evidence / 'history-validation-progress.json'
@@ -616,8 +617,11 @@ def native_acceptance(codex_home, evidence, source_ids, destination_ids, full=Fa
             orphan_history = comprehensive['unregistered_history_ids']
             if comprehensive['status'] != 'passed' or offsets['status'] != 'passed':
                 errors.append({'component': 'full_history', 'error': '全量原生字段或日志偏移校验未通过'})
+            local_links = history_module().links_module().audit(codex_home, source_home, target_home, client)
+            if local_links['status'] != 'passed':
+                errors.append({'component': 'local_links', 'error': '聊天资源链接或原生文件读取校验未通过'})
         return {'status': 'passed' if not missing and not errors else 'failed',
-                'full_history': comprehensive, 'offsets': offsets,
+                'full_history': comprehensive, 'offsets': offsets, 'local_links': local_links,
                 'source_threads': len(source_ids), 'preserved_target_threads': len(destination_ids),
                 'listed_threads': len(listed), 'read_threads': len(checked), 'missing_ids': missing,
                 'attached_threads': len(expected & attached),

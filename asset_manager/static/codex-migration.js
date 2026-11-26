@@ -34,10 +34,12 @@ export async function mountCodexMigration(host, {api, toast}) {
       <p><strong>${esc(plan.host)}</strong> · ${esc(plan.root)}</p><p>${esc(plan.detail)}</p>
       <div class="actions" style="flex-wrap:wrap;margin:16px 0">${[
         ['文件与链接',plan.result?.status==='passed'],['完整会话与历史',plan.native_acceptance?.full_history?.status==='passed'&&plan.native_acceptance?.offsets?.status==='passed'],
+        ['聊天资源链接',plan.native_acceptance?.local_links?.status==='passed'&&plan.native_acceptance?.local_links?.native_checked],
         ['工程与 Git',plan.workspace_acceptance?.status==='passed'],['目标 Atlas',plan.atlas_deployment?.status==='running']
       ].map(([label,ok])=>`<span class="badge">${ok?'✓':'○'} ${label}${ok?' 已通过':' 待验证'}</span>`).join('')}</div>
       ${plan.native_acceptance?`<p>原生读取 ${Number(plan.native_acceptance.read_threads||0)} 条会话 · 保留目标原有 ${Number(plan.native_acceptance.preserved_target_threads||0)} 条 · 历史分页验证 ${Number(plan.native_acceptance.history_samples?.length||0)} 条</p>`:''}
       ${plan.native_acceptance?.full_history?`<p>全量历史：${Number(plan.native_acceptance.full_history.turns_checked||0).toLocaleString()} 个轮次 · ${Number(plan.native_acceptance.full_history.items_checked||0).toLocaleString()} 条内容逐字段验证 · ${Number(plan.native_acceptance.offsets?.checked_fields||0).toLocaleString()} 个日志位置检查。</p>`:plan.native_acceptance?'<p class="notice">此前为抽样验收，尚未通过完整历史验证。请准备修复副本后完成全量验收。</p>':''}
+      ${plan.native_acceptance?.local_links?`<p>聊天资源：${Number(plan.native_acceptance.local_links.unique_paths||0).toLocaleString()} 个本地路径 · ${Number(plan.native_acceptance.local_links.available_media?.length||0)} 个现存媒体 · ${Number(plan.native_acceptance.local_links.remaining_old_references?.length||0)} 处旧链接待修复。已执行原生文件读取检查；未将它等同于桌面聊天的视觉验收。</p><p class="notice">缺失资源 ${Number(plan.native_acceptance.local_links.missing_resources?.length||0)} 个，详见校验报告；缺失文件不计为恢复成功。超过 16 MiB 的媒体只验证文件哈希和原生元数据。</p>`:plan.native_acceptance?'<p class="notice">此报告未验证聊天正文资源。请准备历史与资源链接修复副本后重新验收。</p>':''}
       ${plan.history_maintenance?`<p>历史一致性修复：${esc(({prepared:'隔离副本已准备',validated:'隔离验收通过',validation_failed:'隔离验收发现问题',installed:'已接入，待最终验收'})[plan.history_maintenance.status]||plan.history_maintenance.status)} · 原有内容保护 ${esc(plan.history_maintenance.preservation?.status||'待验证')} · 校准 ${Number(plan.history_maintenance.rollout_repairs?.offsets?.repaired_fields||0).toLocaleString()} 个日志位置。</p>`:''}
       ${plan.finished_history?`<p>已结束会话补同步：${Number(plan.finished_history.branches||0)} 个分支 · ${esc(({captured:'已捕获，等待合入隔离副本',staged:'已合入隔离副本，等待验收',installed:'已接入目标环境'})[plan.finished_history.status]||plan.finished_history.status)}。捕获时 ${Number(plan.finished_history.pending_turns?.length||0)} 个未结束轮次另行列出；尚未产生的后续输出不计入本次完成范围。</p>`:''}
       ${plan.native_acceptance?.offsets?.missing_logs?.length?`<p>有 ${plan.native_acceptance.offsets.missing_logs.length} 组历史缺少对应 JSONL，数据库内容仍保留；报告单列来源缺口，不将其显示为日志完整通过。</p>`:''}
@@ -59,14 +61,14 @@ export async function mountCodexMigration(host, {api, toast}) {
     if(receipt?.id===plan.id)target.querySelector('[data-receipt-output]').textContent=JSON.stringify(receipt.data,null,2);
     if(['complete','native_verified','activated_pending_acceptance'].includes(plan.status)) {
       const controls=document.createElement('div');controls.className='actions';
-      controls.innerHTML='<button class="secondary" data-history-prepare>准备历史一致性修复</button><button class="secondary" data-capture-finished>捕获已结束会话的补同步内容</button>'+
+      controls.innerHTML='<button class="secondary" data-history-prepare>准备历史与资源链接修复</button><button class="secondary" data-capture-finished>捕获已结束会话的补同步内容</button>'+
         (plan.finished_history?.status==='captured'&&['prepared','validated','validation_failed'].includes(plan.history_maintenance?.status)?'<button class="secondary" data-apply-finished>合入隔离副本并检查冲突</button>':'')+
         (['prepared','validated','validation_failed'].includes(plan.history_maintenance?.status)?'<button class="secondary" data-history-verify>全量验证隔离副本</button>':'')+
         (plan.history_maintenance?.status==='validated'?'<button class="primary" data-history-install>保留当前副本，重启目标并接入修复</button>':'');
       target.querySelector('[data-receipt-output]').before(controls);
     }
     const finish=target.querySelector('[data-complete]');
-    if(finish&&(plan.native_acceptance?.full_history?.status!=='passed'||plan.native_acceptance?.offsets?.status!=='passed'))finish.disabled=true;
+    if(finish&&(plan.native_acceptance?.full_history?.status!=='passed'||plan.native_acceptance?.offsets?.status!=='passed'||plan.native_acceptance?.local_links?.status!=='passed'||!plan.native_acceptance?.local_links?.native_checked))finish.disabled=true;
     function action(selector, path, body, message) {
       target.querySelector(selector)?.addEventListener('click',async()=>{
         if(busy)return;busy=true;target.querySelectorAll('button').forEach(b=>b.disabled=true);
