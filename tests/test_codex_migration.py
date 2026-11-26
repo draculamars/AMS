@@ -685,5 +685,9 @@ def test_receiver_refreshes_local_receipts_without_ssh(env,monkeypatch):
     assert current['native_acceptance']['full_history']['items_checked']==267193
     assert current['status']=='received' and '最新回执' in current['detail']
     assert migration.listing()[0]['detail']==current['detail']
+    (root/'evidence/workspace-acceptance.json').write_text(json.dumps({'status':'needs_attention','git_errors':[{'path':'changed-target'}]}))
+    refreshed=migration.read(ident)
+    assert '工程 Git尚未通过' in refreshed['detail'] and '已通过迁移验收' not in refreshed['detail']
+    assert refreshed['workspace_acceptance']['status']=='needs_attention'
     (root/'ATLAS-MIGRATION.json').write_text(json.dumps({'id':'wrong'}))
     with pytest.raises(ValueError,match='不匹配'):migration.read(ident)

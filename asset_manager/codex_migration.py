@@ -59,6 +59,10 @@ def read(ident):
             if name in receipts:value[field]=receipts[name]
         if receipts.get('completion.json',{}).get('status')=='complete':
             value['detail']='本机接收内容已通过迁移验收；下列状态读取本机最新回执，来源与原始副本保留'
+        outstanding = [label for name,label in [('native-acceptance.json','原生会话'),('workspace-acceptance.json','工程 Git')]
+                       if name in receipts and receipts[name].get('status') != 'passed']
+        if outstanding:
+            value['detail']='最新回执中'+ '、'.join(outstanding)+'尚未通过；此前完成记录不能代替本次复验，当前数据与原始副本均保留'
         if value.get('history_maintenance',{}).get('status')=='installed' and value.get('finished_history'):
             value['finished_history']['status']='installed'
     return value
